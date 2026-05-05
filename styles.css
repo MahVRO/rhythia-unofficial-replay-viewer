@@ -1,0 +1,345 @@
+:root {
+  --ink: #ffffff;
+  --muted: rgba(255,255,255,0.55);
+  --accent: #e8006f;
+  --accent2: #42c0f5;
+  --transport-bg: rgba(0,0,0,0.72);
+  --overlay-bg: rgba(0,0,0,0.45);
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  width: 100%; height: 100%;
+  overflow: hidden;
+  background: #000;
+  font-family: "Space Grotesk", sans-serif;
+  color: var(--ink);
+}
+
+/* Stage */
+.player-stage {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+}
+
+canvas {
+  width: 100%; height: 100%;
+  display: block;
+  background: #050a0f;
+}
+
+/* Drop zone */
+.dropzone {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.72);
+  cursor: pointer;
+  border: 2px dashed rgba(255,255,255,0.18);
+  transition: background 150ms;
+}
+
+.dropzone:hover,
+.dropzone.drag-over {
+  background: rgba(0,30,55,0.82);
+  border-color: var(--accent2);
+}
+
+.dropzone.hidden { display: none; }
+
+.dropzone-inner {
+  text-align: center;
+  pointer-events: none;
+}
+
+.drop-icon {
+  font-size: 3rem;
+  margin-bottom: 12px;
+  opacity: 0.5;
+}
+
+.drop-title {
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+.drop-subtitle {
+  font-size: 0.9rem;
+  color: var(--muted);
+  margin-top: 6px;
+}
+
+/* Overlay base */
+.overlay {
+  position: fixed;
+  z-index: 5;
+}
+
+/* Top-left: song info */
+.top-left {
+  top: 16px;
+  left: 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: var(--overlay-bg);
+  backdrop-filter: blur(6px);
+  border-radius: 10px;
+  padding: 10px 14px 10px 10px;
+  max-width: 340px;
+}
+
+.song-art {
+  width: 52px;
+  height: 52px;
+  border-radius: 6px;
+  background: rgba(255,255,255,0.08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.5rem;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.song-art img {
+  width: 100%; height: 100%;
+  object-fit: cover;
+  border-radius: 6px;
+}
+
+.song-text {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.song-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+
+.song-artist {
+  font-size: 0.78rem;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 240px;
+}
+
+.song-badges {
+  display: flex;
+  gap: 5px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+}
+
+.badge {
+  font-size: 0.68rem;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 20px;
+  letter-spacing: 0.04em;
+}
+
+.badge-diff {
+  background: rgba(66,192,245,0.22);
+  color: var(--accent2);
+  border: 1px solid rgba(66,192,245,0.4);
+}
+
+.badge-mods {
+  background: rgba(232,0,111,0.18);
+  color: #ff5fa8;
+  border: 1px solid rgba(232,0,111,0.35);
+}
+
+/* Top-left stats: COMBO + score */
+.top-left-stats {
+  top: 112px;
+  left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: none;
+}
+
+.stat-block {
+  display: grid;
+}
+
+.stat-label {
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  text-shadow: 0 1px 4px #000;
+}
+
+.stat-value {
+  font-size: 2.4rem;
+  font-weight: 700;
+  line-height: 1.1;
+  text-shadow: 0 2px 10px rgba(0,0,0,0.8);
+}
+
+.stat-score {
+  font-size: 1.5rem;
+  color: rgba(255,255,255,0.75);
+}
+
+/* Top-right: accuracy + misses */
+.top-right {
+  top: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.right-align {
+  text-align: right;
+}
+
+/* Bottom-left: player info */
+.bottom-left {
+  bottom: 86px;
+  left: 16px;
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--overlay-bg);
+  backdrop-filter: blur(6px);
+  border-radius: 10px;
+  padding: 8px 12px;
+}
+
+.player-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.1);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.4rem;
+  flex-shrink: 0;
+  overflow: hidden;
+  border: 2px solid rgba(255,255,255,0.18);
+}
+
+.player-name {
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.player-type {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+/* Transport bar */
+.transport {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 6;
+  height: 54px;
+  background: var(--transport-bg);
+  backdrop-filter: blur(10px);
+  border-top: 1px solid rgba(255,255,255,0.1);
+  display: grid;
+  grid-template-columns: auto auto auto 1fr auto auto;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+}
+
+.btn-icon {
+  background: none;
+  border: none;
+  color: var(--ink);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+  opacity: 0.7;
+  transition: opacity 120ms;
+  font-family: inherit;
+}
+
+.btn-icon:hover { opacity: 1; }
+
+.btn-play {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: #fff;
+  color: #000;
+  border: none;
+  font-size: 0.85rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding-left: 2px;
+  transition: opacity 120ms;
+}
+
+.btn-play:disabled { opacity: 0.3; cursor: not-allowed; }
+.btn-play:not(:disabled):hover { opacity: 0.8; }
+
+.time-label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.82rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+#seek {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+#seek:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.map-link {
+  font-size: 0.78rem;
+  color: var(--accent2);
+  text-decoration: none;
+  white-space: nowrap;
+  opacity: 0.8;
+}
+
+.map-link:hover { opacity: 1; text-decoration: underline; }
+
+.speed-wrap select {
+  background: rgba(255,255,255,0.07);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.8rem;
+  border-radius: 6px;
+  padding: 4px 6px;
+  cursor: pointer;
+}
+
+.speed-wrap select:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.hidden { display: none !important; }
