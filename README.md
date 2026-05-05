@@ -1,2 +1,6 @@
-# rhythia-unofficial-replay-viewer
-An unofficial Rhythia .rhr replay files web viewer.
+# Rhythia Unofficial Replay Viewer
+
+Current focus:
+- Decode replay data as accurately as possible.
+- Improve cursor playback so it looks stable and realistic.
+- Fix all of my current blatant bugs.
