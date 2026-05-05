@@ -811,55 +811,194 @@ function sampleCursor(samples, tMs) {
   };
 }
 
-function drawGrid(gx, gy, size) {
-  const edge = Math.floor(size * 0.14);
-  const inset = Math.floor(size * 0.28);
+// ─── 3D Rendering System ─────────────────────────────────────────────────
 
-  ctx.fillStyle = "rgba(4, 8, 10, 0.86)";
-  ctx.fillRect(gx, gy, size, size);
+// World dimensions: the hit plane is a square ±GRID_HALF in x and y, at z = 0.
+// Notes (when added) will spawn at NOTE_SPAWN_Z and travel toward z = 0.
+const GRID_HALF = 1.5;
+const NOTE_SPAWN_Z = 22;
 
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.1)";
-  ctx.lineWidth = 2;
-  ctx.strokeRect(gx, gy, size, size);
+// Fixed perspective camera
+const CAM_POS  = { x: 0, y: 1.5, z: -3.5 };
+const CAM_LOOK = { x: 0, y: 0,   z: 10  };
+const CAM_FOV  = 65; // degrees
 
-  ctx.strokeStyle = "rgba(138, 210, 185, 0.8)";
-  ctx.lineWidth = 4;
+let _camBasis = null;
 
-  // top-left
-  ctx.beginPath();
-  ctx.moveTo(gx, gy + edge);
-  ctx.lineTo(gx, gy);
-  ctx.lineTo(gx + edge, gy);
-  ctx.stroke();
-
-  // top-right
-  ctx.beginPath();
-  ctx.moveTo(gx + size - edge, gy);
-  ctx.lineTo(gx + size, gy);
-  ctx.lineTo(gx + size, gy + edge);
-  ctx.stroke();
-
-  // bottom-left
-  ctx.beginPath();
-  ctx.moveTo(gx, gy + size - edge);
-  ctx.lineTo(gx, gy + size);
-  ctx.lineTo(gx + edge, gy + size);
-  ctx.stroke();
-
-  // bottom-right
-  ctx.beginPath();
-  ctx.moveTo(gx + size - edge, gy + size);
-  ctx.lineTo(gx + size, gy + size);
-  ctx.lineTo(gx + size, gy + size - edge);
-  ctx.stroke();
-
-  ctx.strokeStyle = "rgba(22, 180, 90, 0.4)";
-  ctx.lineWidth = 2;
-  ctx.strokeRect(gx + inset, gy + inset, size - inset * 2, size - inset * 2);
+function normalize3(v) {
+  const len = Math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+  if (len < 1e-9) return { x: 0, y: 0, z: 1 };
+  return { x: v.x / len, y: v.y / len, z: v.z / len };
 }
 
-function mapNormToPx(n, origin, size) {
-  return origin + Math.min(1, Math.max(0, n)) * size;
+function cross3(a, b) {
+  return {
+    x: a.y * b.z - a.z * b.y,
+    y: a.z * b.x - a.x * b.z,
+    z: a.x * b.y - a.y * b.x,
+  };
+}
+
+function dot3(a, b) {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+function getCamBasis() {
+  if (!_camBasis) {
+    const fwd = normalize3({
+      x: CAM_LOOK.x - CAM_POS.x,
+      y: CAM_LOOK.y - CAM_POS.y,
+      z: CAM_LOOK.z - CAM_POS.z,
+    });
+    const worldUp = { x: 0, y: 1, z: 0 };
+    const right = normalize3(cross3(fwd, worldUp));
+    const up = normalize3(cross3(right, fwd));
+    _camBasis = { fwd, right, up };
+  }
+  return _camBasis;
+}
+
+/**
+ * Project a 3D world point (wx, wy, wz) onto canvas pixels.
+ * Returns { px, py, depth } or null if the point is behind the camera.
+ */
+function project3D(wx, wy, wz, canvasW, canvasH) {
+  const basis = getCamBasis();
+  const dx = wx - CAM_POS.x;
+  const dy = wy - CAM_POS.y;
+  const dz = wz - CAM_POS.z;
+
+  const camRight = dot3({ x: dx, y: dy, z: dz }, basis.right);
+  const camUp    = dot3({ x: dx, y: dy, z: dz }, basis.up);
+  const camDepth = dot3({ x: dx, y: dy, z: dz }, basis.fwd);
+
+  if (camDepth < 0.05) return null; // behind or too close to camera
+
+  const focalLen = 1 / Math.tan((CAM_FOV * Math.PI / 180) / 2);
+  const aspect   = canvasW / canvasH;
+  const ndcX     = (camRight / camDepth) * focalLen;
+  const ndcY     = (camUp    / camDepth) * focalLen;
+
+  // NDC [-1,1] → pixel space; NDC Y is flipped (canvas Y increases downward)
+  const px = ((ndcX / aspect) + 1) * 0.5 * canvasW;
+  const py = (1 - ndcY) * 0.5 * canvasH;
+
+  return { px, py, depth: camDepth };
+}
+
+/** Convert normalized cursor (0–1) to world coordinates on the hit plane (z = 0). */
+function cursorToWorld(xNorm, yNorm) {
+  return {
+    wx: (xNorm - 0.5) * GRID_HALF * 2,
+    wy: (0.5 - yNorm) * GRID_HALF * 2, // canvas Y increases downward; world Y is up
+    wz: 0,
+  };
+}
+
+/** Project-and-draw a 3D line segment. */
+function drawLine3D(ax, ay, az, bx, by, bz, canvasW, canvasH) {
+  const pa = project3D(ax, ay, az, canvasW, canvasH);
+  const pb = project3D(bx, by, bz, canvasW, canvasH);
+  if (!pa || !pb) return;
+  ctx.beginPath();
+  ctx.moveTo(pa.px, pa.py);
+  ctx.lineTo(pb.px, pb.py);
+  ctx.stroke();
+}
+
+function draw3DField(canvasW, canvasH) {
+  const G = GRID_HALF;
+  const SPAWN = NOTE_SPAWN_Z;
+
+  // --- Depth rails: corner edges from hit plane to spawn plane ---
+  ctx.strokeStyle = "rgba(138, 210, 185, 0.4)";
+  ctx.lineWidth = 1.5;
+  for (const [cx, cy] of [[-G, -G], [-G, G], [G, -G], [G, G]]) {
+    drawLine3D(cx, cy, 0, cx, cy, SPAWN, canvasW, canvasH);
+  }
+
+  // Mid rails (optical guides into depth)
+  ctx.strokeStyle = "rgba(138, 210, 185, 0.15)";
+  ctx.lineWidth = 1;
+  for (const [cx, cy] of [[-G, 0], [G, 0], [0, -G], [0, G]]) {
+    drawLine3D(cx, cy, 0, cx, cy, SPAWN, canvasW, canvasH);
+  }
+
+  // --- Far (spawn) plane border ---
+  ctx.strokeStyle = "rgba(100, 180, 255, 0.18)";
+  ctx.lineWidth = 1.5;
+  drawLine3D(-G, -G, SPAWN,  G, -G, SPAWN, canvasW, canvasH);
+  drawLine3D( G, -G, SPAWN,  G,  G, SPAWN, canvasW, canvasH);
+  drawLine3D( G,  G, SPAWN, -G,  G, SPAWN, canvasW, canvasH);
+  drawLine3D(-G,  G, SPAWN, -G, -G, SPAWN, canvasW, canvasH);
+
+  // --- Hit plane background fill ---
+  const corners3D = [
+    project3D(-G, -G, 0, canvasW, canvasH),
+    project3D( G, -G, 0, canvasW, canvasH),
+    project3D( G,  G, 0, canvasW, canvasH),
+    project3D(-G,  G, 0, canvasW, canvasH),
+  ];
+  if (corners3D.every(Boolean)) {
+    ctx.fillStyle = "rgba(4, 8, 10, 0.86)";
+    ctx.beginPath();
+    ctx.moveTo(corners3D[0].px, corners3D[0].py);
+    for (let i = 1; i < corners3D.length; i++) {
+      ctx.lineTo(corners3D[i].px, corners3D[i].py);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // --- Hit plane inner grid lines ---
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.07)";
+  ctx.lineWidth = 1;
+  const DIVS = 3;
+  for (let i = 1; i < DIVS; i++) {
+    const t = -G + (i / DIVS) * G * 2;
+    drawLine3D(t, -G, 0, t, G, 0, canvasW, canvasH);
+    drawLine3D(-G, t, 0, G, t, 0, canvasW, canvasH);
+  }
+
+  // --- Hit plane outer border ---
+  ctx.strokeStyle = "rgba(138, 210, 185, 0.8)";
+  ctx.lineWidth = 3;
+  drawLine3D(-G, -G, 0,  G, -G, 0, canvasW, canvasH);
+  drawLine3D( G, -G, 0,  G,  G, 0, canvasW, canvasH);
+  drawLine3D( G,  G, 0, -G,  G, 0, canvasW, canvasH);
+  drawLine3D(-G,  G, 0, -G, -G, 0, canvasW, canvasH);
+
+  // --- Corner accent marks (BeatLeader-style) ---
+  const EDGE = G * 0.35;
+  ctx.strokeStyle = "rgba(138, 210, 185, 1.0)";
+  ctx.lineWidth = 4;
+  const accentCorners = [
+    { ox: -G, oy: -G, ex:  EDGE, ey:  EDGE },
+    { ox:  G, oy: -G, ex: -EDGE, ey:  EDGE },
+    { ox:  G, oy:  G, ex: -EDGE, ey: -EDGE },
+    { ox: -G, oy:  G, ex:  EDGE, ey: -EDGE },
+  ];
+  for (const { ox, oy, ex, ey } of accentCorners) {
+    const pc  = project3D(ox,      oy,      0, canvasW, canvasH);
+    const pe1 = project3D(ox + ex, oy,      0, canvasW, canvasH);
+    const pe2 = project3D(ox,      oy + ey, 0, canvasW, canvasH);
+    if (pc && pe1 && pe2) {
+      ctx.beginPath();
+      ctx.moveTo(pe1.px, pe1.py);
+      ctx.lineTo(pc.px,  pc.py);
+      ctx.lineTo(pe2.px, pe2.py);
+      ctx.stroke();
+    }
+  }
+
+  // --- Inner square accent ---
+  const IS = G * 0.55;
+  ctx.strokeStyle = "rgba(22, 180, 90, 0.4)";
+  ctx.lineWidth = 2;
+  drawLine3D(-IS, -IS, 0,  IS, -IS, 0, canvasW, canvasH);
+  drawLine3D( IS, -IS, 0,  IS,  IS, 0, canvasW, canvasH);
+  drawLine3D( IS,  IS, 0, -IS,  IS, 0, canvasW, canvasH);
+  drawLine3D(-IS,  IS, 0, -IS, -IS, 0, canvasW, canvasH);
 }
 
 function ensureCanvasSize() {
@@ -887,33 +1026,33 @@ function drawReplay() {
     return;
   }
 
-  const pad = Math.max(16, Math.min(w, h) * 0.04);
-  const gridSize = Math.min(w - pad * 2, h - pad * 2);
-  const gx = (w - gridSize) / 2;
-  const gy = (h - gridSize) / 2;
-  drawGrid(gx, gy, gridSize);
+  // Draw 3D perspective field
+  draw3DField(w, h);
 
+  // Sample cursor position and project onto hit plane (z = 0)
   const sample = sampleCursor(replay.samples, state.currentMs);
-  const margin = 0.08;
-  const playX = margin + (1 - margin * 2) * sample.xNorm;
-  const playY = margin + (1 - margin * 2) * sample.yNorm;
-  const cx = mapNormToPx(playX, gx, gridSize);
-  const cy = mapNormToPx(playY, gy, gridSize);
+  const { wx, wy, wz } = cursorToWorld(sample.xNorm, sample.yNorm);
+  const proj = project3D(wx, wy, wz, w, h);
+  if (!proj) return;
 
-  // Cursor
-  ctx.fillStyle = "#ef476f";
-  ctx.beginPath();
-  ctx.arc(cx, cy, 9, 0, Math.PI * 2);
-  ctx.fill();
+  const cx = proj.px;
+  const cy = proj.py;
 
+  // Cursor size: scale with canvas width for consistent look regardless of DPR
+  const radius = Math.max(5, w * 0.011);
+
+  // Glow ring
   ctx.strokeStyle = "rgba(239, 71, 111, 0.35)";
-  ctx.lineWidth = 10;
+  ctx.lineWidth = radius * 1.1;
   ctx.beginPath();
-  ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+  ctx.arc(cx, cy, radius * 1.9, 0, Math.PI * 2);
   ctx.stroke();
 
-  // Status text
-  // Clean stage: do not draw debug text overlays.
+  // Cursor dot
+  ctx.fillStyle = "#ef476f";
+  ctx.beginPath();
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  ctx.fill();
 }
 
 function parseSongMeta(raw, playerName) {
