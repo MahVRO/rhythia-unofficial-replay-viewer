@@ -12,12 +12,48 @@
 <body>
   <input id="fileInput" type="file" accept=".rhr" hidden />
 
-  <!-- Full-screen stage -->
-  <div class="player-stage">
-    <canvas id="view"></canvas>
+  <div class="layout">
+    <main class="player-stage">
+      <canvas id="view"></canvas>
+    </main>
   </div>
 
-  <!-- Drop zone overlay -->
+  <!-- HUD data store: hidden DOM nodes whose textContent / style is read by
+       the canvas renderer each frame. Keeps stat updates as plain DOM
+       writes without needing a parallel data layer. -->
+  <div id="hud-data" hidden>
+    <span id="songName">Rhythia Replay Viewer</span>
+    <span id="timeLabel">00:00 / 00:00</span>
+    <span id="comboVal">0x</span>
+    <span id="pauseVal">0</span>
+    <span id="rankVal">D</span>
+    <span id="accVal">0%</span>
+    <span id="scoreVal">0</span>
+    <span id="pointsVal">0</span>
+    <span id="missVal">0</span>
+    <span id="noteCountVal">0/0</span>
+    <span id="modsRow"></span>
+    <span id="progressFill" style="width:0%"></span>
+    <span id="healthFill" style="width:100%;background:#4ade80"></span>
+  </div>
+
+  <!-- Floating transport (controls overlay) -->
+  <div class="transport-floating" id="transportFloating">
+    <button class="btn-icon" id="openFile" title="Open replay">&#128194;</button>
+    <button id="playPause" disabled title="Play / pause">&#9654;</button>
+    <input id="seek" type="range" min="0" max="1" step="0.0001" value="0" disabled hidden />
+    <select id="speed" class="speed-select" disabled title="Playback speed">
+      <option value="0.25">0.25x</option>
+      <option value="0.5">0.5x</option>
+      <option value="0.75">0.75x</option>
+      <option value="1" selected>1x</option>
+      <option value="1.5">1.5x</option>
+      <option value="2">2x</option>
+    </select>
+    <a class="map-link hidden" id="mapLink" target="_blank" rel="noopener noreferrer">map &#8599;</a>
+  </div>
+
+  <!-- Drop zone overlay (initial state) -->
   <section id="dropZone" class="dropzone" tabindex="0" role="button" aria-label="Drop replay file here">
     <div class="dropzone-inner">
       <div class="drop-icon">&#9654;</div>
@@ -25,70 +61,6 @@
       <p class="drop-subtitle">or click to browse</p>
     </div>
   </section>
-
-  <!-- Top-left: song info -->
-  <div class="overlay top-left" id="songInfo">
-    <div class="song-art" id="songArt">&#9835;</div>
-    <div class="song-text">
-      <div class="song-name" id="songName">Rhythia Replay Viewer</div>
-      <div class="song-artist" id="songArtist">open a replay to begin</div>
-      <div class="song-badges">
-        <span class="badge badge-diff" id="songDiff">--</span>
-        <span class="badge badge-mods hidden" id="songMods"></span>
-      </div>
-    </div>
-  </div>
-
-  <!-- Top-left below song: COMBO + score -->
-  <div class="overlay top-left-stats" id="statsLeft">
-    <div class="stat-block">
-      <div class="stat-label">COMBO</div>
-      <div class="stat-value" id="comboVal">0</div>
-    </div>
-    <div class="stat-block">
-      <div class="stat-value stat-score" id="scoreVal">0</div>
-    </div>
-  </div>
-
-  <!-- Top-right: multiplier + accuracy -->
-  <div class="overlay top-right" id="statsRight">
-    <div class="stat-block right-align">
-      <div class="stat-label">ACCURACY</div>
-      <div class="stat-value" id="accVal">--%</div>
-    </div>
-    <div class="stat-block right-align">
-      <div class="stat-label">MISSES</div>
-      <div class="stat-value" id="missVal">0</div>
-    </div>
-  </div>
-
-  <!-- Bottom-left: player info -->
-  <div class="overlay bottom-left" id="playerInfo">
-    <div class="player-avatar" id="playerAvatar">&#128100;</div>
-    <div class="player-text">
-      <div class="player-name" id="playerName">--</div>
-      <div class="player-type" id="playerType"></div>
-    </div>
-  </div>
-
-  <!-- Bottom: transport bar -->
-  <footer class="transport" id="transport">
-    <button class="btn-icon" id="openFile" title="Open replay">&#128194;</button>
-    <button class="btn-play" id="playPause" disabled>&#9654;</button>
-    <span class="time-label" id="timeLabel">0:00 / 0:00</span>
-    <input id="seek" type="range" min="0" max="1" step="0.0001" value="0" disabled />
-    <a class="map-link hidden" id="mapLink" target="_blank" rel="noopener noreferrer">map &#8599;</a>
-    <label class="speed-wrap">
-      <select id="speed" disabled>
-        <option value="0.25">0.25x</option>
-        <option value="0.5">0.5x</option>
-        <option value="0.75">0.75x</option>
-        <option value="1" selected>1x</option>
-        <option value="1.5">1.5x</option>
-        <option value="2">2x</option>
-      </select>
-    </label>
-  </footer>
 
   <script src="app.js"></script>
 </body>

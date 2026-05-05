@@ -7,17 +7,23 @@ const els = {
   speed: document.getElementById("speed"),
   seek: document.getElementById("seek"),
   timeLabel: document.getElementById("timeLabel"),
-  // overlay elements
+  // top bar
   songName: document.getElementById("songName"),
-  songArtist: document.getElementById("songArtist"),
-  songDiff: document.getElementById("songDiff"),
-  songMods: document.getElementById("songMods"),
+  progressFill: document.getElementById("progressFill"),
+  // left panel
   comboVal: document.getElementById("comboVal"),
-  scoreVal: document.getElementById("scoreVal"),
+  pauseVal: document.getElementById("pauseVal"),
+  rankVal: document.getElementById("rankVal"),
   accVal: document.getElementById("accVal"),
+  // right panel
+  scoreVal: document.getElementById("scoreVal"),
+  pointsVal: document.getElementById("pointsVal"),
   missVal: document.getElementById("missVal"),
-  playerName: document.getElementById("playerName"),
-  playerType: document.getElementById("playerType"),
+  noteCountVal: document.getElementById("noteCountVal"),
+  // bottom bar
+  healthFill: document.getElementById("healthFill"),
+  modsRow: document.getElementById("modsRow"),
+  // misc
   mapLink: document.getElementById("mapLink"),
 };
 
@@ -28,17 +34,22 @@ const state = {
   isPlaying: false,
   currentMs: 0,
   durationMs: 0,
-  motionSmoothing: 0,
-  motionModeOverride: "flags-abs",
   speed: 1,
   lastTick: 0,
+  audio: null,           // HTMLAudioElement when a map's audio is loaded
+  audioUrl: null,        // current object URL (for revoke on swap)
+  audioReady: false,
+  audioTimeScale: 1,     // playbackRate multiplier so song-time tracks replay-time
+  gracePreMs: 400,       // silence before the first note
+  gracePostMs: 4000,     // silence after the last note / song end
+  pauseCount: 0,         // user-triggered pauses during playback
+  lastMissCount: 0,      // edge detector for the miss flash effect
+  missFlashAt: 0,        // performance.now() of the most recent new miss
 };
 
 window.__rvState = state;
 
 const RAW_FRAME_MS = 1000 / 60;
-
-const DISPLAY_MARGIN = 0.08;
 
 function readU8(view, off) {
   return view.getUint8(off);
@@ -133,7 +144,9 @@ function parseRhr(buffer) {
     offObj.off += frameCount;
   }
 
-  const samples = buildPlaybackSamples(frames, frameFlags, mapLengthSec);
+  // Last replay-time millisecond (frame index N-1 at 60Hz). Used as a
+  // fallback when SSPM length is unknown.
+  const lastFrameMs = frameCount > 0 ? (frameCount - 1) * RAW_FRAME_MS : 0;
 
   return {
     magic,
@@ -151,8 +164,7 @@ function parseRhr(buffer) {
     frameCount,
     frames,
     frameFlags,
-    samples,
-    displayTransform: createDisplayTransform(samples),
+    lastFrameMs,
     unknownA,
     unknownB,
     unknownC,
@@ -213,629 +225,6 @@ function getChannel(frame, c) {
   return frame.w;
 }
 
-function choosePositionChannels(frames) {
-  const channels = [0, 1, 2, 3].map((c) => {
-    let finiteCount = 0;
-    let inRangeCount = 0;
-    for (let i = 0; i < frames.length; i++) {
-      const v = getChannel(frames[i], c);
-      if (!isFiniteNumber(v)) continue;
-      finiteCount++;
-      if (v >= -3.2 && v <= 3.2) inRangeCount++;
-    }
-    return {
-      c,
-      finiteCount,
-      inRangeRatio: finiteCount ? inRangeCount / finiteCount : 0,
-      score: finiteCount ? (inRangeCount / finiteCount) * finiteCount : 0,
-    };
-  });
-
-  const sorted = channels.slice().sort((a, b) => b.score - a.score);
-  if (sorted.length >= 2 && sorted[0].inRangeRatio > 0.2 && sorted[1].inRangeRatio > 0.2) {
-    return { xChan: sorted[0].c, yChan: sorted[1].c, confidence: Math.min(sorted[0].inRangeRatio, sorted[1].inRangeRatio) };
-  }
-
-  return { xChan: -1, yChan: -1, confidence: 0 };
-}
-
-function decodeFlagToNorm(flag) {
-  const hi = (flag >> 4) & 0x0f;
-  const lo = flag & 0x0f;
-  const x = hi / 15;
-  const y = lo / 15;
-  return { x, y };
-}
-
-function decodeFlagNibbles(flag, swapAxes = false) {
-  const hi = (flag >> 4) & 0x0f;
-  const lo = flag & 0x0f;
-  if (swapAxes) {
-    return { xNib: lo, yNib: hi };
-  }
-  return { xNib: hi, yNib: lo };
-}
-
-function nibbleToSigned(n) {
-  return n <= 7 ? n : n - 16;
-}
-
-function applyAxisTransform(x, y, invX, invY) {
-  return {
-    x: invX ? 1 - x : x,
-    y: invY ? 1 - y : y,
-  };
-}
-
-function scoreCursorTrajectory(points) {
-  if (points.length < 4) {
-    return -1e9;
-  }
-
-  const coverage = measureCoverage(points);
-  const edgeLock = edgeLockRatio(points);
-  const smoothness = scorePointSeries(points);
-
-  const steps = [];
-  let bigJumps = 0;
-  let hugeJumps = 0;
-  for (let i = 1; i < points.length; i++) {
-    const dx = points[i].xNorm - points[i - 1].xNorm;
-    const dy = points[i].yNorm - points[i - 1].yNorm;
-    const d = Math.hypot(dx, dy);
-    if (!Number.isFinite(d)) continue;
-    steps.push(d);
-    if (d > 0.22) bigJumps++;
-    if (d > 0.32) hugeJumps++;
-  }
-
-  if (!steps.length) {
-    return -1e9;
-  }
-
-  const meanStep = steps.reduce((a, b) => a + b, 0) / steps.length;
-  const p95Step = percentile(steps, 0.95);
-  const p99Step = percentile(steps, 0.99);
-  const bigJumpRatio = bigJumps / steps.length;
-  const hugeJumpRatio = hugeJumps / steps.length;
-
-  // Reward broad but not edge-locked coverage and smooth local motion,
-  // penalize pathological teleports and excessive edge sticking.
-  const score =
-    smoothness * 1.2 +
-    coverage.diag * 0.7 -
-    edgeLock * 0.8 -
-    bigJumpRatio * 2.0 -
-    hugeJumpRatio * 4.5 -
-    p95Step * 0.6 -
-    p99Step * 0.7 -
-    Math.abs(meanStep - 0.03) * 2.5;
-
-  return score;
-}
-
-function clampStep(prevX, prevY, nextX, nextY, maxStep) {
-  const dx = nextX - prevX;
-  const dy = nextY - prevY;
-  const d = Math.hypot(dx, dy);
-  if (!Number.isFinite(d) || d <= maxStep || maxStep <= 0) {
-    return { x: clamp01(nextX), y: clamp01(nextY), clamped: false, step: d };
-  }
-  const s = maxStep / d;
-  return {
-    x: clamp01(prevX + dx * s),
-    y: clamp01(prevY + dy * s),
-    clamped: true,
-    step: maxStep,
-  };
-}
-
-function buildSamplesFromFlags(frames, frameFlags, options) {
-  const samples = new Array(frames.length);
-  if (frameFlags.length < frames.length) {
-    return null;
-  }
-
-  const {
-    mode,
-    swapAxes = false,
-    invX = false,
-    invY = false,
-    holdZero = true,
-    deltaScale = 48,
-    antiSpike = false,
-    name,
-  } = options;
-
-  let x = 0.5;
-  let y = 0.5;
-  let avgStep = 0.03;
-  let clampCount = 0;
-
-  for (let i = 0; i < frames.length; i++) {
-    const flag = frameFlags[i];
-    const { xNib, yNib } = decodeFlagNibbles(flag, swapAxes);
-
-    if (mode === "abs") {
-      if (!holdZero || flag !== 0 || i === 0) {
-        x = xNib / 15;
-        y = yNib / 15;
-      }
-    } else {
-      if (flag !== 0 || i === 0) {
-        const rawX = x + nibbleToSigned(xNib) / deltaScale;
-        const rawY = y + nibbleToSigned(yNib) / deltaScale;
-        if (antiSpike && i > 0) {
-          const adaptiveMaxStep = Math.max(0.085, Math.min(0.24, avgStep * 5.5 + 0.03));
-          const clamped = clampStep(x, y, rawX, rawY, adaptiveMaxStep);
-          x = clamped.x;
-          y = clamped.y;
-          if (clamped.clamped) clampCount++;
-          if (Number.isFinite(clamped.step)) {
-            avgStep = avgStep * 0.97 + clamped.step * 0.03;
-          }
-        } else {
-          x = clamp01(rawX);
-          y = clamp01(rawY);
-        }
-      }
-    }
-
-    const tr = applyAxisTransform(x, y, invX, invY);
-    samples[i] = {
-      t: i * RAW_FRAME_MS,
-      xNorm: tr.x,
-      yNorm: tr.y,
-      flag,
-    };
-  }
-
-  samples.sourceName = name;
-  samples.sourceScore = scoreCursorTrajectory(samples) - (clampCount / Math.max(1, frames.length)) * 0.8;
-  return samples;
-}
-
-function percentile(values, p) {
-  if (!values.length) return 0;
-  const sorted = values.slice().sort((a, b) => a - b);
-  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * p)));
-  return sorted[idx];
-}
-
-function clamp01(v) {
-  return Math.min(1, Math.max(0, v));
-}
-
-function remapByRange(v, lo, hi) {
-  const span = Math.max(1e-9, hi - lo);
-  return clamp01((v - lo) / span);
-}
-
-function scorePointSeries(points) {
-  if (points.length < 4) return 0;
-  let smoothSteps = 0;
-  let validSteps = 0;
-  for (let i = 1; i < points.length; i++) {
-    const dx = points[i].xNorm - points[i - 1].xNorm;
-    const dy = points[i].yNorm - points[i - 1].yNorm;
-    const d = Math.hypot(dx, dy);
-    if (!Number.isFinite(d)) continue;
-    validSteps++;
-    if (d < 0.12) smoothSteps++;
-  }
-  if (!validSteps) return 0;
-  const smoothness = smoothSteps / validSteps;
-  return smoothness;
-}
-
-function measureCoverage(points) {
-  if (!points.length) {
-    return { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0, diag: 0 };
-  }
-
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    if (!Number.isFinite(p.xNorm) || !Number.isFinite(p.yNorm)) continue;
-    if (p.xNorm < minX) minX = p.xNorm;
-    if (p.xNorm > maxX) maxX = p.xNorm;
-    if (p.yNorm < minY) minY = p.yNorm;
-    if (p.yNorm > maxY) maxY = p.yNorm;
-  }
-
-  if (!Number.isFinite(minX) || !Number.isFinite(maxX) || !Number.isFinite(minY) || !Number.isFinite(maxY)) {
-    return { minX: 0, maxX: 0, minY: 0, maxY: 0, width: 0, height: 0, diag: 0 };
-  }
-
-  const width = Math.max(0, maxX - minX);
-  const height = Math.max(0, maxY - minY);
-  const diag = Math.hypot(width, height);
-  return { minX, maxX, minY, maxY, width, height, diag };
-}
-
-function edgeLockRatio(points) {
-  if (!points.length) return 1;
-  let edge = 0;
-  for (let i = 0; i < points.length; i++) {
-    const p = points[i];
-    if (p.xNorm < 0.03 || p.xNorm > 0.97 || p.yNorm < 0.03 || p.yNorm > 0.97) {
-      edge++;
-    }
-  }
-  return edge / points.length;
-}
-
-function evaluateCandidate(points, type) {
-  const smoothness = scorePointSeries(points);
-  const coverage = measureCoverage(points);
-  const edgeLock = edgeLockRatio(points);
-
-  const minWidth = type === "flags" ? 0.04 : 0.08;
-  const minHeight = type === "flags" ? 0.04 : 0.08;
-  const minDiag = type === "flags" ? 0.10 : 0.16;
-
-  const valid = coverage.width >= minWidth && coverage.height >= minHeight && coverage.diag >= minDiag;
-  const score = smoothness + coverage.diag * 0.55 - edgeLock * 0.25;
-
-  return { valid, score, smoothness, coverage, edgeLock };
-}
-
-function smoothAndClamp(points, alpha = 0.22, maxStep = 0.06) {
-  if (!points.length) return points;
-  const out = new Array(points.length);
-  out[0] = { ...points[0] };
-  for (let i = 1; i < points.length; i++) {
-    let x = out[i - 1].xNorm + (points[i].xNorm - out[i - 1].xNorm) * alpha;
-    let y = out[i - 1].yNorm + (points[i].yNorm - out[i - 1].yNorm) * alpha;
-
-    const dx = x - out[i - 1].xNorm;
-    const dy = y - out[i - 1].yNorm;
-    const d = Math.hypot(dx, dy);
-    if (d > maxStep) {
-      const s = maxStep / d;
-      x = out[i - 1].xNorm + dx * s;
-      y = out[i - 1].yNorm + dy * s;
-    }
-
-    out[i] = {
-      ...points[i],
-      xNorm: clamp01(x),
-      yNorm: clamp01(y),
-    };
-  }
-  return out;
-}
-
-function smoothMovingAverage(points, radius = 3) {
-  if (points.length < 3 || radius <= 0) return points;
-  const out = new Array(points.length);
-  for (let i = 0; i < points.length; i++) {
-    let sx = 0;
-    let sy = 0;
-    let c = 0;
-    const from = Math.max(0, i - radius);
-    const to = Math.min(points.length - 1, i + radius);
-    for (let j = from; j <= to; j++) {
-      sx += points[j].xNorm;
-      sy += points[j].yNorm;
-      c++;
-    }
-    out[i] = {
-      ...points[i],
-      xNorm: clamp01(sx / c),
-      yNorm: clamp01(sy / c),
-    };
-  }
-  return out;
-}
-
-function normalizeTrajectory(points) {
-  if (!points.length) return points;
-
-  const xs = points.map((p) => p.xNorm);
-  const ys = points.map((p) => p.yNorm);
-  const x5 = percentile(xs, 0.05);
-  const x95 = percentile(xs, 0.95);
-  const y5 = percentile(ys, 0.05);
-  const y95 = percentile(ys, 0.95);
-
-  // Keep some margin so path does not clip into borders.
-  const outMin = 0.08;
-  const outMax = 0.92;
-  const outSpan = outMax - outMin;
-
-  if (Math.abs(x95 - x5) < 1e-5 || Math.abs(y95 - y5) < 1e-5) {
-    return points;
-  }
-
-  const out = new Array(points.length);
-  for (let i = 0; i < points.length; i++) {
-    const nx = outMin + remapByRange(points[i].xNorm, x5, x95) * outSpan;
-    const ny = outMin + remapByRange(points[i].yNorm, y5, y95) * outSpan;
-    out[i] = { ...points[i], xNorm: clamp01(nx), yNorm: clamp01(ny) };
-  }
-  return out;
-}
-
-function buildCandidateFromFlags(frames, frameFlags, durationMs) {
-  if (frameFlags.length < frames.length) return null;
-  const candidates = [];
-
-  const absoluteModes = [
-    { name: "flags-abs", xf: (n) => n.x, yf: (n) => n.y },
-    { name: "flags-abs-swap", xf: (n) => n.y, yf: (n) => n.x },
-    { name: "flags-abs-invY", xf: (n) => n.x, yf: (n) => 1 - n.y },
-    { name: "flags-abs-invX", xf: (n) => 1 - n.x, yf: (n) => n.y },
-  ];
-
-  for (const mode of absoluteModes) {
-    const points = new Array(frames.length);
-    for (let i = 0; i < frames.length; i++) {
-      const tMs = frames.length <= 1 ? 0 : (i / (frames.length - 1)) * durationMs;
-      const n = decodeFlagToNorm(frameFlags[i]);
-      points[i] = {
-        t: tMs,
-        xNorm: clamp01(mode.xf(n)),
-        yNorm: clamp01(mode.yf(n)),
-        flag: frameFlags[i],
-      };
-    }
-    const evalResult = evaluateCandidate(points, "flags");
-    if (!evalResult.valid) continue;
-    candidates.push({ source: mode.name, points, score: evalResult.score });
-  }
-
-  if (!candidates.length) return null;
-  candidates.sort((a, b) => b.score - a.score);
-  return candidates[0];
-}
-
-function buildCandidateFromChannels(frames, frameFlags, durationMs, xChan, yChan, mode) {
-  const xs = [];
-  const ys = [];
-  for (let i = 0; i < frames.length; i++) {
-    const xv = getChannel(frames[i], xChan);
-    const yv = getChannel(frames[i], yChan);
-    if (isFiniteNumber(xv) && isFiniteNumber(yv)) {
-      xs.push(xv);
-      ys.push(yv);
-    }
-  }
-  if (xs.length < Math.max(32, Math.floor(frames.length * 0.4))) return null;
-
-  const x5 = percentile(xs, 0.05);
-  const x95 = percentile(xs, 0.95);
-  const y5 = percentile(ys, 0.05);
-  const y95 = percentile(ys, 0.95);
-  if (Math.abs(x95 - x5) < 1e-9 || Math.abs(y95 - y5) < 1e-9) return null;
-
-  const points = new Array(frames.length);
-  for (let i = 0; i < frames.length; i++) {
-    const tMs = frames.length <= 1 ? 0 : (i / (frames.length - 1)) * durationMs;
-    const xv = getChannel(frames[i], xChan);
-    const yv = getChannel(frames[i], yChan);
-    let xNorm = 0.5;
-    let yNorm = 0.5;
-
-    if (isFiniteNumber(xv) && isFiniteNumber(yv)) {
-      if (mode === "game") {
-        xNorm = clamp01((xv + 1.5) / 3);
-        yNorm = clamp01((yv + 1.5) / 3);
-      } else {
-        xNorm = remapByRange(xv, x5, x95);
-        yNorm = remapByRange(yv, y5, y95);
-      }
-    }
-
-    points[i] = {
-      t: tMs,
-      xNorm,
-      yNorm,
-      flag: frameFlags.length > i ? frameFlags[i] : null,
-    };
-  }
-
-  const evalResult = evaluateCandidate(points, "channels");
-  if (!evalResult.valid) return null;
-
-  let score = evalResult.score;
-  if (mode === "game") score += 0.05;
-
-  return {
-    source: `channels(${xChan},${yChan})/${mode}`,
-    points,
-    score,
-  };
-}
-
-function selectBestPositionSource(frames, frameFlags, durationMs, forcedMode = "auto") {
-  const candidates = [];
-  let rawFlagCandidate = null;
-  let validFlagCandidate = null;
-
-  // Float channels are still not reliably decoded for current .rhr samples.
-  // Keep the implementation in codebase for future use, but prefer flag stream.
-
-  const flagCandidate = buildCandidateFromFlags(frames, frameFlags, durationMs);
-  if (flagCandidate) {
-    candidates.push(flagCandidate);
-    validFlagCandidate = flagCandidate;
-  }
-
-  if (forcedMode !== "auto") {
-    const exact = candidates.find((c) => c.source === forcedMode);
-    if (exact) return exact;
-  }
-
-  if (forcedMode === "auto") {
-    const stable = candidates.find((c) => c.source === "flags-abs");
-    if (stable) return stable;
-  }
-
-  if (frameFlags.length >= frames.length) {
-    const points = new Array(frames.length);
-    for (let i = 0; i < frames.length; i++) {
-      const tMs = frames.length <= 1 ? 0 : (i / (frames.length - 1)) * durationMs;
-      const n = decodeFlagToNorm(frameFlags[i]);
-      points[i] = { t: tMs, xNorm: n.x, yNorm: n.y, flag: frameFlags[i] };
-    }
-    rawFlagCandidate = { source: "flags-raw", points, score: 0.05 };
-  }
-
-  if (!candidates.length) {
-    if (rawFlagCandidate) return rawFlagCandidate;
-
-    const fallback = new Array(frames.length);
-    for (let i = 0; i < frames.length; i++) {
-      const tMs = frames.length <= 1 ? 0 : (i / (frames.length - 1)) * durationMs;
-      fallback[i] = {
-        t: tMs,
-        xNorm: 0.5,
-        yNorm: 0.5,
-        flag: frameFlags.length > i ? frameFlags[i] : null,
-      };
-    }
-    return { source: "fallback-center", points: fallback, score: 0 };
-  }
-
-  candidates.sort((a, b) => b.score - a.score);
-  if (validFlagCandidate) return validFlagCandidate;
-  return candidates[0];
-}
-
-function buildPlaybackSamples(frames, frameFlags, mapLengthSec) {
-  if (!frames.length) return [];
-
-  if (frameFlags.length < frames.length) {
-    const fallback = new Array(frames.length);
-    for (let i = 0; i < frames.length; i++) {
-      fallback[i] = {
-        t: i * RAW_FRAME_MS,
-        xNorm: 0.5,
-        yNorm: 0.5,
-        flag: null,
-      };
-    }
-    fallback.sourceName = "fallback-center";
-    fallback.sourceScore = 0;
-    return fallback;
-  }
-
-  const variants = [
-    { mode: "abs", name: "flags-abs", holdZero: true },
-    { mode: "abs", name: "flags-abs-swap", holdZero: true, swapAxes: true },
-    { mode: "abs", name: "flags-abs-invY", holdZero: true, invY: true },
-    { mode: "abs", name: "flags-abs-invX", holdZero: true, invX: true },
-    { mode: "abs", name: "flags-abs-swap-invY", holdZero: true, swapAxes: true, invY: true },
-    { mode: "delta", name: "flags-delta-48", deltaScale: 48, antiSpike: true },
-    { mode: "delta", name: "flags-delta-64", deltaScale: 64, antiSpike: true },
-    { mode: "delta", name: "flags-delta-80", deltaScale: 80, antiSpike: true },
-    { mode: "delta", name: "flags-delta-96", deltaScale: 96, antiSpike: true },
-    { mode: "delta", name: "flags-delta-128", deltaScale: 128, antiSpike: true },
-    { mode: "delta", name: "flags-delta-64-swap", deltaScale: 64, swapAxes: true, antiSpike: true },
-    { mode: "delta", name: "flags-delta-96-swap", deltaScale: 96, swapAxes: true, antiSpike: true },
-    { mode: "delta", name: "flags-delta-64-invY", deltaScale: 64, invY: true, antiSpike: true },
-    { mode: "delta", name: "flags-delta-96-invY", deltaScale: 96, invY: true, antiSpike: true },
-  ];
-
-  const candidates = [];
-  for (const v of variants) {
-    const s = buildSamplesFromFlags(frames, frameFlags, v);
-    if (!s) continue;
-    candidates.push(s);
-  }
-
-  if (!candidates.length) {
-    const fallback = new Array(frames.length);
-    for (let i = 0; i < frames.length; i++) {
-      fallback[i] = {
-        t: i * RAW_FRAME_MS,
-        xNorm: 0.5,
-        yNorm: 0.5,
-        flag: frameFlags[i],
-      };
-    }
-    fallback.sourceName = "fallback-center";
-    fallback.sourceScore = 0;
-    return fallback;
-  }
-
-  candidates.sort((a, b) => b.sourceScore - a.sourceScore);
-  return candidates[0];
-}
-
-function createDisplayTransform(samples) {
-  if (!samples || !samples.length) {
-    return {
-      xLo: 0,
-      xHi: 1,
-      yLo: 0,
-      yHi: 1,
-      invertY: false,
-      outMin: DISPLAY_MARGIN,
-      outMax: 1 - DISPLAY_MARGIN,
-    };
-  }
-
-  const xs = [];
-  const ys = [];
-  for (let i = 0; i < samples.length; i++) {
-    const p = samples[i];
-    if (!Number.isFinite(p.xNorm) || !Number.isFinite(p.yNorm)) continue;
-    xs.push(p.xNorm);
-    ys.push(p.yNorm);
-  }
-
-  if (!xs.length || !ys.length) {
-    return {
-      xLo: 0,
-      xHi: 1,
-      yLo: 0,
-      yHi: 1,
-      invertY: false,
-      outMin: DISPLAY_MARGIN,
-      outMax: 1 - DISPLAY_MARGIN,
-    };
-  }
-
-  const xLo = percentile(xs, 0.03);
-  const xHi = percentile(xs, 0.97);
-  const yLo = percentile(ys, 0.03);
-  const yHi = percentile(ys, 0.97);
-
-  const yMean = ys.reduce((a, b) => a + b, 0) / ys.length;
-  // Rhythia replays generally place center near 0.5; choose orientation that keeps mean near center.
-  const invertY = Math.abs((1 - yMean) - 0.5) < Math.abs(yMean - 0.5);
-
-  return {
-    xLo,
-    xHi: Math.max(xLo + 1e-4, xHi),
-    yLo,
-    yHi: Math.max(yLo + 1e-4, yHi),
-    invertY,
-    outMin: DISPLAY_MARGIN,
-    outMax: 1 - DISPLAY_MARGIN,
-  };
-}
-
-function applyDisplayTransform(xNorm, yNorm, transform) {
-  if (!transform) {
-    return { x: clamp01(xNorm), y: clamp01(yNorm) };
-  }
-
-  const outSpan = Math.max(1e-6, transform.outMax - transform.outMin);
-  const fitX = transform.outMin + remapByRange(xNorm, transform.xLo, transform.xHi) * outSpan;
-  const fitY = transform.outMin + remapByRange(yNorm, transform.yLo, transform.yHi) * outSpan;
-  const y = transform.invertY ? 1 - fitY : fitY;
-
-  return {
-    x: clamp01(fitX),
-    y: clamp01(y),
-  };
-}
 
 function safeJsonParse(value, fallback) {
   try {
@@ -845,58 +234,24 @@ function safeJsonParse(value, fallback) {
   }
 }
 
-function formatSec(ms) {
-  return (ms / 1000).toFixed(2) + "s";
-}
-
-function findFrameIndex(samples, tMs) {
-  let lo = 0;
-  let hi = samples.length - 1;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (samples[mid].t < tMs) lo = mid + 1;
-    else hi = mid - 1;
-  }
-  return Math.min(Math.max(lo, 0), samples.length - 1);
-}
-
-function lerp(a, b, alpha) {
-  return a + (b - a) * alpha;
-}
-
-function sampleCursor(samples, tMs) {
-  if (!samples.length) {
-    return { xNorm: 0.5, yNorm: 0.5 };
-  }
-
-  const iFloat = tMs / RAW_FRAME_MS;
-  const i0 = Math.max(0, Math.min(samples.length - 1, Math.floor(iFloat)));
-  const i1 = Math.max(0, Math.min(samples.length - 1, i0 + 1));
-  const alpha = clamp01(iFloat - i0);
-
-  const a = samples[i0];
-  const b = samples[i1];
-
-  const xNorm = lerp(a.xNorm, b.xNorm, alpha);
-  const yNorm = lerp(a.yNorm, b.yNorm, alpha);
-
-  return {
-    xNorm,
-    yNorm,
-  };
-}
-
 // ─── 3D Rendering System ─────────────────────────────────────────────────
 
-// World dimensions: the hit plane is a square ±GRID_HALF in x and y, at z = 0.
+// World dimensions: the hit plane is a flat square ±GRID_HALF in x and y, at z = 0.
 // Notes (when added) will spawn at NOTE_SPAWN_Z and travel toward z = 0.
-const GRID_HALF = 1.5;
-const NOTE_SPAWN_Z = 22;
+const GRID_HALF = 1.4;
+const NOTE_SPAWN_Z = 18;
 
-// Fixed perspective camera
-const CAM_POS  = { x: 0, y: 2.15, z: -5.4 };
-const CAM_LOOK = { x: 0, y: -0.25, z: 9.2 };
-const CAM_FOV  = 62; // degrees
+// Note travel timing (in song-time ms, before speedScale)
+const NOTE_LOOKAHEAD_MS = 500; // distance from spawn to hit plane in song-time
+// Hit radius in world units. SS hit box is ~1.14 units in 0..2 grid coords ≈ 0.57 cells.
+const NOTE_HIT_RADIUS_CELLS = 0.62;
+
+// Fixed perspective camera. Straight-on Rhythia POV: dead center, level
+// (no pitch). Pulled back ~20% from the original distance for a wider
+// view of the playfield.
+const CAM_POS  = { x: 0, y: 0, z: -4.6 };
+const CAM_LOOK = { x: 0, y: 0, z: 1 };
+const CAM_FOV  = 55; // degrees
 
 let _camBasis = null;
 
@@ -926,8 +281,9 @@ function getCamBasis() {
       z: CAM_LOOK.z - CAM_POS.z,
     });
     const worldUp = { x: 0, y: 1, z: 0 };
-    const right = normalize3(cross3(fwd, worldUp));
-    const up = normalize3(cross3(right, fwd));
+    // Right-handed Y-up: +X world maps to screen right.
+    const right = normalize3(cross3(worldUp, fwd));
+    const up = normalize3(cross3(fwd, right));
     _camBasis = { fwd, right, up };
   }
   return _camBasis;
@@ -961,15 +317,6 @@ function project3D(wx, wy, wz, canvasW, canvasH) {
   return { px, py, depth: camDepth };
 }
 
-/** Convert normalized cursor (0–1) to world coordinates on the hit plane (z = 0). */
-function cursorToWorld(xNorm, yNorm) {
-  return {
-    wx: (xNorm - 0.5) * GRID_HALF * 2,
-    wy: (0.5 - yNorm) * GRID_HALF * 2, // canvas Y increases downward; world Y is up
-    wz: 0,
-  };
-}
-
 /** Project-and-draw a 3D line segment. */
 function drawLine3D(ax, ay, az, bx, by, bz, canvasW, canvasH) {
   const pa = project3D(ax, ay, az, canvasW, canvasH);
@@ -981,99 +328,349 @@ function drawLine3D(ax, ay, az, bx, by, bz, canvasW, canvasH) {
   ctx.stroke();
 }
 
+// ─── Notes (SSPM v2) ────────────────────────────────────────────────────
+
+/**
+ * Parse a Sound Space Plus Map v2 file.
+ * Returns { notes: [{ ms, x, y }], lastMs, noteCount, audioBytes, audioMime }.
+ * x,y are in [0,2] grid coords (integer mode) or floats (decimal mode).
+ */
+function parseSspm(buffer) {
+  const u = new Uint8Array(buffer);
+  const dv = new DataView(buffer);
+  if (u.length < 128 || u[0] !== 0x53 || u[1] !== 0x53 || u[2] !== 0x2B || u[3] !== 0x6D) {
+    throw new Error("Not an SSPM file");
+  }
+  if (u[4] !== 2) {
+    throw new Error("Only SSPM v2 is supported (got v" + u[4] + ")");
+  }
+  const lastMs    = dv.getUint32(30, true);
+  const noteCount = dv.getUint32(34, true);
+  const hasAudio  = u[45];
+  const audioOff  = Number(dv.getBigUint64(64, true));
+  const audioLen  = Number(dv.getBigUint64(72, true));
+  const markersOff = Number(dv.getBigUint64(112, true));
+  const markersLen = Number(dv.getBigUint64(120, true));
+  const markersEnd = markersOff + markersLen;
+  if (markersEnd > u.length) throw new Error("SSPM markers section out of bounds");
+
+  let audioBytes = null;
+  let audioMime = null;
+  if (hasAudio && audioLen > 0 && audioOff + audioLen <= u.length) {
+    audioBytes = u.slice(audioOff, audioOff + audioLen);
+    audioMime = detectAudioMime(audioBytes);
+  }
+
+  const notes = [];
+  let off = markersOff;
+  while (off + 5 <= markersEnd) {
+    const ms = dv.getUint32(off, true);
+    off += 4;
+    const type = u[off++];
+    if (type !== 0) {
+      // Unknown marker type — we can't reliably skip without a generic value reader.
+      // Bail out; we already have the notes that came before.
+      break;
+    }
+    if (off + 1 > markersEnd) break;
+    const isFloat = u[off++];
+    let x;
+    let y;
+    if (isFloat) {
+      if (off + 8 > markersEnd) break;
+      x = dv.getFloat32(off, true); off += 4;
+      y = dv.getFloat32(off, true); off += 4;
+    } else {
+      if (off + 2 > markersEnd) break;
+      x = u[off++];
+      y = u[off++];
+    }
+    notes.push({ ms, x, y });
+  }
+  notes.sort((a, b) => a.ms - b.ms);
+  return { notes, lastMs, noteCount, audioBytes, audioMime };
+}
+
+/** Detect audio MIME from the first few bytes of a blob. */
+function detectAudioMime(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) return "audio/mpeg"; // ID3
+  if (bytes.length >= 2 && bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0) return "audio/mpeg"; // raw MP3 frame
+  if (bytes.length >= 4 && bytes[0] === 0x4F && bytes[1] === 0x67 && bytes[2] === 0x67 && bytes[3] === 0x53) return "audio/ogg"; // OggS
+  if (bytes.length >= 4 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return "audio/wav"; // RIFF
+  return "audio/mpeg";
+}
+
+/** Fetch the beatmap page from Rhythia's API and download + parse the .sspm. */
+async function fetchMapAssets(mapPageId) {
+  if (!Number.isFinite(mapPageId) || mapPageId <= 0) return null;
+  const apiRes = await fetch("https://production.rhythia.com/api/getBeatmapPage", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: mapPageId, session: "" }),
+  });
+  if (!apiRes.ok) throw new Error("Beatmap page fetch failed: " + apiRes.status);
+  const meta = await apiRes.json();
+  const beatmapUrl = meta?.beatmap?.beatmapFile;
+  if (!beatmapUrl) return null;
+  const sspmRes = await fetch(beatmapUrl);
+  if (!sspmRes.ok) throw new Error("SSPM download failed: " + sspmRes.status);
+  const buf = await sspmRes.arrayBuffer();
+  const parsed = parseSspm(buf);
+  return { ...parsed, beatmap: meta.beatmap };
+}
+
+/** Convert SSPM grid coordinates (x,y in [0,2]) to world coords on the hit plane.
+ *  In Sound Space, x=0,1,2 are *cell centers*, not the outer edges of the playfield.
+ *  So a 3-cell grid with half-extent GRID_HALF puts cells at ±(2/3)*GRID_HALF and 0. */
+function noteToWorld(x, y) {
+  const CELL = (2 * GRID_HALF) / 3;
+  return {
+    wx: (x - 1) * CELL,         // x=0 → -CELL, x=1 → 0, x=2 → +CELL
+    wy: (1 - y) * CELL,         // y=0 (top in SS) → +CELL, y=2 (bottom) → -CELL
+    wz: 0,
+  };
+}
+
+/** Cursor decoding has been retired (frame-flag deltas never produced an
+ *  accurate playhead). Every note is reported as a hit until a working
+ *  decoder is rebuilt. The sliced miss markers still flow through the
+ *  rest of the pipeline, so the moment we have real data we just
+ *  populate the array here. */
+function computeNoteHits(replay /*, speedScale */) {
+  if (!replay || !replay.notes) return null;
+  const out = new Array(replay.notes.length);
+  for (let i = 0; i < replay.notes.length; i++) out[i] = "hit";
+  return out;
+}
+
+async function loadMapNotes(replay) {
+  const data = await fetchMapAssets(replay.mapPageId);
+  if (!data || !data.notes || data.notes.length === 0) return;
+
+  // Map note timing (raw song ms) to replay timeline ms. Replay frames are
+  // recorded at the *played* speed, so notes need to be scaled to the replay
+  // duration so that the last note lines up with the song's end.
+  const mapMs = Math.max(
+    data.lastMs || 0,
+    data.notes[data.notes.length - 1]?.ms || 0,
+  );
+  const replayMs = state.durationMs || replay.lastFrameMs;
+  let speedScale = 1;
+  if (mapMs > 1000 && replayMs > 1000) {
+    speedScale = replayMs / mapMs;
+  }
+
+  replay.notes = data.notes;
+  replay.notesTimeScale = speedScale;
+  replay.noteHits = computeNoteHits(replay, speedScale);
+
+  if (Array.isArray(replay.noteHits)) {
+    let misses = 0;
+    for (const v of replay.noteHits) if (v === "miss") misses++;
+    replay.missCount = misses;
+    if (els.missVal) els.missVal.textContent = String(misses);
+  }
+
+  // Wire audio if the SSPM provided it.
+  if (data.audioBytes && data.audioBytes.length > 0) {
+    setupAudio(data.audioBytes, data.audioMime, speedScale);
+  }
+}
+
+/** Create/replace the HTMLAudioElement from raw bytes and prepare sync. */
+function setupAudio(bytes, mime, notesTimeScale) {
+  // Tear down any previous audio first
+  teardownAudio();
+
+  const blob = new Blob([bytes], { type: mime || "audio/mpeg" });
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio();
+  audio.preload = "auto";
+  audio.src = url;
+
+  state.audio = audio;
+  state.audioUrl = url;
+  state.audioReady = false;
+  state.audioTimeScale = notesTimeScale || 1;
+
+  audio.addEventListener("loadedmetadata", () => {
+    state.audioReady = true;
+    syncAudioToTimeline(true);
+  });
+  audio.addEventListener("error", () => {
+    console.warn("Audio failed to load");
+    teardownAudio();
+  });
+}
+
+function teardownAudio() {
+  if (state.audio) {
+    try { state.audio.pause(); } catch {}
+    state.audio.src = "";
+  }
+  if (state.audioUrl) {
+    try { URL.revokeObjectURL(state.audioUrl); } catch {}
+  }
+  state.audio = null;
+  state.audioUrl = null;
+  state.audioReady = false;
+}
+
+/** Convert replay-timeline ms to song-time seconds. */
+function replayMsToSongSec(replayMs) {
+  const scale = state.audioTimeScale || 1;
+  return (replayMs / scale) / 1000;
+}
+
+/** Push the audio element to match the current replay state. */
+function syncAudioToTimeline(force) {
+  const audio = state.audio;
+  if (!audio || !state.audioReady) return;
+  const targetSec = replayMsToSongSec(replayMs());
+  // Audio playback rate must equal replay-speed / notesTimeScale so that
+  // d(songTime)/d(realTime) matches d(replayTime)/d(realTime) / notesTimeScale.
+  const desiredRate = (state.speed || 1) / (state.audioTimeScale || 1);
+  if (Math.abs(audio.playbackRate - desiredRate) > 0.001) {
+    audio.playbackRate = Math.max(0.0625, Math.min(16, desiredRate));
+  }
+  if (force || Math.abs(audio.currentTime - targetSec) > 0.12) {
+    try { audio.currentTime = Math.max(0, Math.min(audio.duration || targetSec, targetSec)); } catch {}
+  }
+  // Hard-mute (and pause) during the pre/post-roll grace windows so the
+  // viewer is silent while the playfield is empty.
+  const inGrace = state.currentMs < state.gracePreMs ||
+                  state.currentMs > (state.durationMs - state.gracePostMs);
+  if (inGrace) {
+    if (!audio.paused) audio.pause();
+    return;
+  }
+  if (state.isPlaying && audio.paused) {
+    audio.play().catch(() => {});
+  } else if (!state.isPlaying && !audio.paused) {
+    audio.pause();
+  }
+}
+
+/** Render notes spawning at the back and traveling toward the hit plane.
+ *  - Hit notes vanish at the hit time.
+ *  - Missed notes continue flying past the hit plane for NOTE_MISS_FLY_MS,
+ *    fading as they pass the player. */
+function drawNotes(canvasW, canvasH) {
+  const replay = state.replay;
+  if (!replay || !replay.notes || replay.notes.length === 0) return;
+
+  const speedScale = replay.notesTimeScale || 1;
+  const tNow = replayMs();
+
+  const lookahead = NOTE_LOOKAHEAD_MS * speedScale;
+  const hits = replay.noteHits;
+
+  // World-space size of one cell, used to size the on-screen note tile.
+  const CELL = (2 * GRID_HALF) / 3;
+  const NOTE_HALF_WORLD = CELL * 0.42;
+
+  // Reference depth at the center of the hit plane, for perspective scaling.
+  const refProj = project3D(0, 0, 0, canvasW, canvasH);
+  if (!refProj) return;
+  const refSizeProj = project3D(NOTE_HALF_WORLD, 0, 0, canvasW, canvasH);
+  if (!refSizeProj) return;
+  const refPixelHalf = Math.abs(refSizeProj.px - refProj.px);
+
+  // Collect visible notes — only future / current. Past notes (hit OR miss)
+  // simply disappear once they reach the hit plane.
+  const notes = replay.notes;
+  const visible = [];
+  for (let i = 0; i < notes.length; i++) {
+    const n = notes[i];
+    const adjMs = n.ms * speedScale;
+    const dt = adjMs - tNow;
+    if (dt > lookahead || dt < 0) continue;
+    const verdict = hits ? hits[i] : "unknown";
+    visible.push({ n, idx: i, dt, verdict });
+  }
+  // Far first so closer notes overlap correctly
+  visible.sort((a, b) => b.dt - a.dt);
+
+  for (const v of visible) {
+    const { n, dt } = v;
+    const z = (dt / lookahead) * NOTE_SPAWN_Z;
+    const w = noteToWorld(n.x, n.y);
+
+    const center = project3D(w.wx, w.wy, z, canvasW, canvasH);
+    if (!center) continue;
+
+    const depthScale = Math.max(0.06, refProj.depth / Math.max(1e-6, center.depth));
+    const halfPx = Math.max(3, refPixelHalf * depthScale);
+
+    const closeness = 1 - Math.min(1, dt / lookahead); // 0 far → 1 at hit
+    const alpha = 0.35 + closeness * 0.55;
+    // All notes use the same blue regardless of verdict.
+    const baseColor = "110, 195, 255";
+    if (alpha <= 0) continue;
+
+    const cx = center.px;
+    const cy = center.py;
+    const radius = halfPx * 0.32;
+    const stroke = Math.max(1.5, halfPx * 0.16);
+
+    // Single hollow rounded square — no inner outline.
+    ctx.lineWidth = stroke;
+    ctx.strokeStyle = `rgba(${baseColor}, ${alpha.toFixed(3)})`;
+    roundRect(cx - halfPx, cy - halfPx, halfPx * 2, halfPx * 2, radius);
+    ctx.stroke();
+  }
+}
+
 function draw3DField(canvasW, canvasH) {
   const G = GRID_HALF;
-  const SPAWN = NOTE_SPAWN_Z;
+  // Match the real Rhythia HUD: no playfield fill (the bg is just black),
+  // no outer border — only four L-shaped corner brackets framing the
+  // projected hit plane.
+  const tl = project3D(-G,  G, 0, canvasW, canvasH);
+  const tr = project3D( G,  G, 0, canvasW, canvasH);
+  const br = project3D( G, -G, 0, canvasW, canvasH);
+  const bl = project3D(-G, -G, 0, canvasW, canvasH);
+  if (!tl || !tr || !br || !bl) return;
 
-  // --- Depth rails: corner edges from hit plane to spawn plane ---
-  ctx.strokeStyle = "rgba(138, 210, 185, 0.4)";
-  ctx.lineWidth = 1.5;
-  for (const [cx, cy] of [[-G, -G], [-G, G], [G, -G], [G, G]]) {
-    drawLine3D(cx, cy, 0, cx, cy, SPAWN, canvasW, canvasH);
-  }
+  const armX = Math.max(20, Math.min(46, (tr.px - tl.px) * 0.055));
+  const armY = Math.max(20, Math.min(46, (bl.py - tl.py) * 0.055));
+  const r    = 14; // corner radius
 
-  // Mid rails (optical guides into depth)
-  ctx.strokeStyle = "rgba(138, 210, 185, 0.15)";
-  ctx.lineWidth = 1;
-  for (const [cx, cy] of [[-G, 0], [G, 0], [0, -G], [0, G]]) {
-    drawLine3D(cx, cy, 0, cx, cy, SPAWN, canvasW, canvasH);
-  }
+  ctx.strokeStyle = "rgba(170, 178, 190, 0.55)";
+  ctx.lineWidth   = 2.5;
+  ctx.lineCap     = "round";
 
-  // --- Far (spawn) plane border ---
-  ctx.strokeStyle = "rgba(100, 180, 255, 0.18)";
-  ctx.lineWidth = 1.5;
-  drawLine3D(-G, -G, SPAWN,  G, -G, SPAWN, canvasW, canvasH);
-  drawLine3D( G, -G, SPAWN,  G,  G, SPAWN, canvasW, canvasH);
-  drawLine3D( G,  G, SPAWN, -G,  G, SPAWN, canvasW, canvasH);
-  drawLine3D(-G,  G, SPAWN, -G, -G, SPAWN, canvasW, canvasH);
+  // Top-left bracket
+  ctx.beginPath();
+  ctx.moveTo(tl.px,            tl.py + armY);
+  ctx.lineTo(tl.px,            tl.py + r);
+  ctx.quadraticCurveTo(tl.px,  tl.py, tl.px + r, tl.py);
+  ctx.lineTo(tl.px + armX,     tl.py);
+  ctx.stroke();
 
-  // --- Hit plane background fill ---
-  const corners3D = [
-    project3D(-G, -G, 0, canvasW, canvasH),
-    project3D( G, -G, 0, canvasW, canvasH),
-    project3D( G,  G, 0, canvasW, canvasH),
-    project3D(-G,  G, 0, canvasW, canvasH),
-  ];
-  if (corners3D.every(Boolean)) {
-    ctx.fillStyle = "rgba(4, 8, 10, 0.86)";
-    ctx.beginPath();
-    ctx.moveTo(corners3D[0].px, corners3D[0].py);
-    for (let i = 1; i < corners3D.length; i++) {
-      ctx.lineTo(corners3D[i].px, corners3D[i].py);
-    }
-    ctx.closePath();
-    ctx.fill();
-  }
+  // Top-right bracket
+  ctx.beginPath();
+  ctx.moveTo(tr.px - armX,     tr.py);
+  ctx.lineTo(tr.px - r,        tr.py);
+  ctx.quadraticCurveTo(tr.px,  tr.py, tr.px, tr.py + r);
+  ctx.lineTo(tr.px,            tr.py + armY);
+  ctx.stroke();
 
-  // --- Hit plane inner grid lines ---
-  ctx.strokeStyle = "rgba(255, 255, 255, 0.07)";
-  ctx.lineWidth = 1;
-  const DIVS = 3;
-  for (let i = 1; i < DIVS; i++) {
-    const t = -G + (i / DIVS) * G * 2;
-    drawLine3D(t, -G, 0, t, G, 0, canvasW, canvasH);
-    drawLine3D(-G, t, 0, G, t, 0, canvasW, canvasH);
-  }
+  // Bottom-right bracket
+  ctx.beginPath();
+  ctx.moveTo(br.px,            br.py - armY);
+  ctx.lineTo(br.px,            br.py - r);
+  ctx.quadraticCurveTo(br.px,  br.py, br.px - r, br.py);
+  ctx.lineTo(br.px - armX,     br.py);
+  ctx.stroke();
 
-  // --- Hit plane outer border ---
-  ctx.strokeStyle = "rgba(138, 210, 185, 0.8)";
-  ctx.lineWidth = 3;
-  drawLine3D(-G, -G, 0,  G, -G, 0, canvasW, canvasH);
-  drawLine3D( G, -G, 0,  G,  G, 0, canvasW, canvasH);
-  drawLine3D( G,  G, 0, -G,  G, 0, canvasW, canvasH);
-  drawLine3D(-G,  G, 0, -G, -G, 0, canvasW, canvasH);
-
-  // --- Corner accent marks (BeatLeader-style) ---
-  const EDGE = G * 0.35;
-  ctx.strokeStyle = "rgba(138, 210, 185, 1.0)";
-  ctx.lineWidth = 4;
-  const accentCorners = [
-    { ox: -G, oy: -G, ex:  EDGE, ey:  EDGE },
-    { ox:  G, oy: -G, ex: -EDGE, ey:  EDGE },
-    { ox:  G, oy:  G, ex: -EDGE, ey: -EDGE },
-    { ox: -G, oy:  G, ex:  EDGE, ey: -EDGE },
-  ];
-  for (const { ox, oy, ex, ey } of accentCorners) {
-    const pc  = project3D(ox,      oy,      0, canvasW, canvasH);
-    const pe1 = project3D(ox + ex, oy,      0, canvasW, canvasH);
-    const pe2 = project3D(ox,      oy + ey, 0, canvasW, canvasH);
-    if (pc && pe1 && pe2) {
-      ctx.beginPath();
-      ctx.moveTo(pe1.px, pe1.py);
-      ctx.lineTo(pc.px,  pc.py);
-      ctx.lineTo(pe2.px, pe2.py);
-      ctx.stroke();
-    }
-  }
-
-  // --- Inner square accent ---
-  const IS = G * 0.55;
-  ctx.strokeStyle = "rgba(22, 180, 90, 0.4)";
-  ctx.lineWidth = 2;
-  drawLine3D(-IS, -IS, 0,  IS, -IS, 0, canvasW, canvasH);
-  drawLine3D( IS, -IS, 0,  IS,  IS, 0, canvasW, canvasH);
-  drawLine3D( IS,  IS, 0, -IS,  IS, 0, canvasW, canvasH);
-  drawLine3D(-IS,  IS, 0, -IS, -IS, 0, canvasW, canvasH);
+  // Bottom-left bracket
+  ctx.beginPath();
+  ctx.moveTo(bl.px + armX,     bl.py);
+  ctx.lineTo(bl.px + r,        bl.py);
+  ctx.quadraticCurveTo(bl.px,  bl.py, bl.px, bl.py - r);
+  ctx.lineTo(bl.px,            bl.py - armY);
+  ctx.stroke();
 }
 
 function ensureCanvasSize() {
@@ -1094,7 +691,7 @@ function drawReplay() {
   const h = els.canvas.height;
   ctx.clearRect(0, 0, w, h);
 
-  if (!replay || replay.samples.length === 0) {
+  if (!replay || replay.frameCount === 0) {
     ctx.fillStyle = "rgba(245, 247, 255, 0.8)";
     ctx.font = "600 20px 'Space Grotesk'";
     ctx.fillText("Load a replay to begin", 24, 40);
@@ -1104,31 +701,260 @@ function drawReplay() {
   // Draw 3D perspective field
   draw3DField(w, h);
 
-  // Sample cursor position and project onto hit plane (z = 0)
-  const sample = sampleCursor(replay.samples, state.currentMs);
-  const displayPoint = applyDisplayTransform(sample.xNorm, sample.yNorm, replay.displayTransform);
-  const { wx, wy, wz } = cursorToWorld(displayPoint.x, displayPoint.y);
-  const proj = project3D(wx, wy, wz, w, h);
-  if (!proj) return;
+  // Draw notes (back-to-front).
+  drawNotes(w, h);
 
-  const cx = proj.px;
-  const cy = proj.py;
+  // Cursor rendering removed — see computeNoteHits comment. The HUD walls
+  // sit on top so the playfield reads as the focal element.
+  drawHUDWalls(w, h);
+}
 
-  // Cursor size: scale with canvas width for consistent look regardless of DPR
-  const radius = Math.max(5, w * 0.011);
+// ----------------------------------------------------------------------
+// HUD WALLS
+// ----------------------------------------------------------------------
+// The HUD lives inside the 3D scene as four trapezoidal walls forming an
+// open box around the playfield. Each wall's BACK edge is the projected
+// edge of the hit plane (so the inner cutout is the playfield); each wall's
+// FRONT edge is the corresponding canvas edge. Stat text is rendered into
+// the screen-space gap between the two edges, kept upright for legibility.
+function drawHUDWalls(w, h) {
+  const G = GRID_HALF;
+  const tl = project3D(-G,  G, 0, w, h);
+  const tr = project3D( G,  G, 0, w, h);
+  const br = project3D( G, -G, 0, w, h);
+  const bl = project3D(-G, -G, 0, w, h);
+  if (!tl || !tr || !br || !bl) return;
 
-  // Glow ring
-  ctx.strokeStyle = "rgba(239, 71, 111, 0.35)";
-  ctx.lineWidth = radius * 1.1;
-  ctx.beginPath();
-  ctx.arc(cx, cy, radius * 1.9, 0, Math.PI * 2);
-  ctx.stroke();
+  // Canvas corners (front edges) — kept for layout calls below.
+  const ftl = { px: 0,  py: 0  };
+  const ftr = { px: w,  py: 0  };
+  const fbr = { px: w,  py: h  };
+  const fbl = { px: 0,  py: h  };
 
-  // Cursor dot
-  ctx.fillStyle = "#ef476f";
-  ctx.beginPath();
-  ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+  // No wall fills, no seam outlines, no mitre lines — only the central
+  // playfield square stays. HUD text panels are drawn flush against the
+  // projected playfield edges below.
+
+  drawTopWall(ftl, ftr, tl, tr);
+  drawBottomWall(fbl, fbr, bl, br);
+  drawLeftWall(ftl, tl, bl, fbl);
+  drawRightWall(ftr, tr, br, fbr);
+}
+
+function drawTopWall(ftl, ftr, tl, tr) {
+  const songName = els.songName?.textContent || "";
+  const time     = els.timeLabel?.textContent || "";
+  const w = els.canvas.width;
+
+  // Header is anchored to the canvas top, NOT the playfield — matches the
+  // real Rhythia HUD where title/time stack vertically with a thin divider
+  // running underneath.
+  const centerX = w / 2;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+
+  // Title line
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "600 22px 'Space Grotesk'";
+  ctx.fillText(songName, centerX, 40);
+
+  // Time line
+  ctx.fillStyle = "rgba(220,225,235,0.85)";
+  ctx.font = "600 18px 'JetBrains Mono'";
+  ctx.fillText(time, centerX, 70);
+
+  // Top progress bar — display-only, grey track + white fill, sits under
+  // the title block. Width matches the health bar (playfield width + 40px
+  // outset on each side) so the two read as a matched pair.
+  const pct = parseFloat(els.progressFill?.style.width || "0") || 0;
+  const padX = 40;
+  const barX = tl.px - padX;
+  const barW = (tr.px + padX) - barX;
+  const barY = 92;
+  const barH = 4;
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.fillRect(barX, barY, barW, barH);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(barX, barY, barW * (pct / 100), barH);
+}
+
+function drawBottomWall(fbl, fbr, bl, br) {
+  const w = els.canvas.width;
+  const h = els.canvas.height;
+
+  // --- Health bar: pinned just under the projected playfield bottom edge,
+  // spans the playfield width (with a small outset). Green/red health colors.
+  const healthPct = Math.max(0, Math.min(100, parseFloat(els.healthFill?.style.width || "100") || 0));
+  const healthCol = els.healthFill?.style.background || "#4ade80";
+  const HEALTH_H  = 12;
+  const healthY   = bl.py + 22;
+  const padX      = 40;
+  const xLeft     = bl.px - padX;
+  const xRight    = br.px + padX;
+  const barW      = xRight - xLeft;
+  ctx.fillStyle   = "rgba(255,255,255,0.10)";
+  ctx.strokeStyle = "rgba(255,255,255,0.18)";
+  ctx.lineWidth   = 1;
+  roundRect(xLeft, healthY, barW, HEALTH_H, 6);
   ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = healthCol;
+  roundRect(xLeft, healthY, barW * (healthPct / 100), HEALTH_H, 6);
+  ctx.fill();
+
+  // --- Interactive song-progress bar: bottom of the canvas. Same colors
+  // as the top progress bar (grey track, white fill) so it doesn't look
+  // like the health bar.
+  const pct = parseFloat(els.progressFill?.style.width || "0") || 0;
+  const margin = Math.max(40, w * 0.06);
+  const sxLeft  = margin;
+  const sBarW   = w - margin * 2;
+  const sBarH   = 8;
+  const sy      = h - 28;
+
+  state.seekBarRect = { x: sxLeft, y: sy, w: sBarW, h: sBarH };
+
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  roundRect(sxLeft, sy, sBarW, sBarH, 4);
+  ctx.fill();
+  ctx.fillStyle = "#ffffff";
+  roundRect(sxLeft, sy, sBarW * (pct / 100), sBarH, 4);
+  ctx.fill();
+
+  // Handle dot for drag affordance
+  const hx = sxLeft + sBarW * (pct / 100);
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.arc(hx, sy + sBarH / 2, 6, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function roundRect(x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  ctx.lineTo(x + rr, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+  ctx.lineTo(x, y + rr);
+  ctx.quadraticCurveTo(x, y, x + rr, y);
+  ctx.closePath();
+}
+
+function drawSideStat(centerX, y, label, value, valueOpts = {}) {
+  // Real Rhythia: muted grey UPPERCASE label sits ABOVE the bold white
+  // value, both centered.
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillStyle = "rgba(180,185,195,0.75)";
+  ctx.font = "600 13px 'Space Grotesk'";
+  ctx.fillText(label, centerX, y);
+  ctx.fillStyle = valueOpts.color || "#ffffff";
+  ctx.font = `700 ${valueOpts.size || 22}px 'Space Grotesk'`;
+  ctx.fillText(value, centerX, y + (valueOpts.gap || 26));
+}
+
+function drawComboTriangle(centerX, centerY, comboText) {
+  // Equilateral triangle (point up). Geometric centroid sits 1/3 up from
+  // the base, so we offset the text downward to land inside the triangle.
+  const size = 86;
+  const h    = size * 0.92;
+  const apexY = centerY - h * 0.55;
+  const baseY = centerY + h * 0.45;
+  ctx.strokeStyle = "rgba(200,205,215,0.65)";
+  ctx.lineWidth = 2;
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(centerX,             apexY);
+  ctx.lineTo(centerX + size * 0.55, baseY);
+  ctx.lineTo(centerX - size * 0.55, baseY);
+  ctx.closePath();
+  ctx.stroke();
+  // Centroid of triangle = apexY + (2/3)*(baseY - apexY)
+  const cy = apexY + (baseY - apexY) * (2 / 3);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "700 20px 'Space Grotesk'";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(comboText, centerX, cy);
+}
+
+function drawLeftWall(ftl, tl, bl, fbl) {
+  // Sit the column close to the playfield's left bracket (slightly inset
+  // from canvas left), matching the real Rhythia HUD where COMBO/SS/ACC
+  // hug the field instead of pinning to the screen edge.
+  const h = els.canvas.height;
+  const colX = Math.max(110, tl.px - 130);
+
+  // Combo triangle — aligned vertically with the top playfield bracket
+  drawComboTriangle(colX, tl.py + 30, els.comboVal?.textContent || "0x");
+
+  // PAUSES — just below the combo triangle
+  drawSideStat(colX, tl.py + 130,
+    "PAUSES",
+    els.pauseVal?.textContent || "0",
+    { size: 22, gap: 28 });
+
+  // Rank — large letter (no label in real game), centered vertically
+  const rank = els.rankVal?.textContent || "D";
+  ctx.fillStyle = "#f3c79a";
+  ctx.font = "700 60px 'Space Grotesk'";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(rank, colX, h * 0.55);
+
+  // ACCURACY — closer to the rank letter, not pinned to the bottom bracket
+  drawSideStat(colX, h * 0.72,
+    "ACCURACY",
+    els.accVal?.textContent || "0%",
+    { size: 22, gap: 28 });
+}
+
+function drawRightWall(ftr, tr, br, fbr) {
+  const w = els.canvas.width;
+  const h = els.canvas.height;
+  const colX = Math.min(w - 110, tr.px + 130);
+
+  drawSideStat(colX, tr.py + 30,
+    "SCORE",
+    els.scoreVal?.textContent || "0",
+    { size: 24, gap: 28 });
+
+  drawSideStat(colX, tr.py + 130,
+    "POINTS",
+    els.pointsVal?.textContent || "0",
+    { size: 22, gap: 28 });
+
+  // MISSES — default white, only flashes red briefly when a miss lands.
+  const flashElapsed = performance.now() - state.missFlashAt;
+  const FLASH_DUR = 450;
+  let missColor = "#ffffff";
+  let shakeX = 0;
+  if (state.missFlashAt > 0 && flashElapsed < FLASH_DUR) {
+    const k = 1 - flashElapsed / FLASH_DUR;
+    // Lerp red → white
+    const r = 255;
+    const g = Math.round(255 - (255 - 119) * k);
+    const b = Math.round(255 - (255 - 133) * k);
+    missColor = `rgb(${r},${g},${b})`;
+    shakeX = Math.sin(flashElapsed * 0.08) * 4 * k;
+  }
+  ctx.save();
+  ctx.translate(shakeX, 0);
+  drawSideStat(colX, h * 0.55 - 14,
+    "MISSES",
+    els.missVal?.textContent || "0",
+    { size: 22, color: missColor, gap: 28 });
+  ctx.restore();
+
+  // NOTES — closer to the misses block, not pinned to the bottom bracket
+  drawSideStat(colX, h * 0.72,
+    "NOTES",
+    els.noteCountVal?.textContent || "0/0",
+    { size: 22, gap: 28 });
 }
 
 function parseSongMeta(raw, playerName) {
@@ -1166,37 +992,69 @@ function buildRhythiaMapUrl(mapPageId) {
   return `https://www.rhythia.com/maps/${mapPageId}`;
 }
 
+/** Friendly short tag for a Rhythia mod identifier. */
+const MOD_LABELS = {
+  mod_nofail: "NF",
+  mod_no_fail: "NF",
+  mod_hardrock: "HR",
+  mod_hard_rock: "HR",
+  mod_easy: "EZ",
+  mod_doubletime: "DT",
+  mod_double_time: "DT",
+  mod_halftime: "HT",
+  mod_half_time: "HT",
+  mod_nightcore: "NC",
+  mod_sudden_death: "SD",
+  mod_suddendeath: "SD",
+  mod_perfect: "PF",
+  mod_flashlight: "FL",
+  mod_hidden: "HD",
+  mod_relax: "RX",
+  mod_autoplay: "AT",
+  mod_spinhide: "SP",
+  mod_spinHide: "SP",
+};
+
+function modLabel(raw) {
+  if (!raw) return "";
+  const key = String(raw).toLowerCase();
+  if (MOD_LABELS[key]) return MOD_LABELS[key];
+  // Strip "mod_" prefix and uppercase the rest
+  return String(raw).replace(/^mod_/i, "").replaceAll("_", " ").toUpperCase();
+}
+
 function renderMeta(replay) {
-  const mods = Array.isArray(replay.mods) ? replay.mods.filter(Boolean).join(", ") : String(replay.mods);
   const playerName = replay.mode || replay.profileType || "Unknown";
   const parsed = parseSongMeta(replay.mapId, playerName);
   const mapUrl = buildRhythiaMapUrl(replay.mapPageId);
 
-  // Song overlay
-  els.songName.textContent = parsed.title;
-  els.songArtist.textContent = parsed.artist;
-  els.songDiff.textContent = replay.profileType ? replay.profileType.replaceAll("_", " ") : "--";
-  // Stat overlays — only show what's available from the replay header
-  els.accVal.textContent = "--%";
-  els.missVal.textContent = "--";
-  els.comboVal.textContent = "0";
-  els.scoreVal.textContent = "0";
+  // Top bar
+  const songFull = parsed.artist ? `${parsed.artist} - ${parsed.title}` : parsed.title;
+  els.songName.textContent = songFull;
 
-  // Speed modifier badge in mods area
+  // Reset stats
+  els.accVal.textContent = "0%";
+  els.missVal.textContent = "0";
+  els.comboVal.textContent = "0x";
+  els.scoreVal.textContent = "0";
+  els.pointsVal.textContent = "0";
+  els.pauseVal.textContent = "0";
+  els.rankVal.textContent = "D";
+  els.noteCountVal.textContent = `0/${replay.noteCount || 0}`;
+  if (els.healthFill) els.healthFill.style.width = "100%";
+  if (els.progressFill) els.progressFill.style.width = "0%";
+
+  // Mods row (bottom bar). Speed mod becomes a tag if not 1x.
+  const modsList = Array.isArray(replay.mods) ? replay.mods.filter(Boolean) : [];
   const speedMod = replay.speedMod;
   const hasSpeedMod = Number.isFinite(speedMod) && Math.abs(speedMod - 1.0) > 0.01;
-  const modsStr = mods && mods !== "none" && mods !== "" ? mods : "";
-  if (hasSpeedMod || modsStr) {
-    els.songMods.textContent = [modsStr, hasSpeedMod ? speedMod.toFixed(2) + "x" : ""].filter(Boolean).join(" ");
-    els.songMods.classList.remove("hidden");
-    } else {
-      els.songMods.classList.add("hidden");
-    }
-  // Player overlay
-  els.playerName.textContent = playerName;
-  els.playerType.textContent = replay.noteCount ? `${replay.noteCount} notes` : "";
+  const tags = modsList.map(modLabel).filter(Boolean);
+  if (hasSpeedMod) tags.push(speedMod.toFixed(2) + "x");
+  els.modsRow.innerHTML = tags.length
+    ? tags.map((t) => `<span class="mod-tag">${escapeHtml(t)}</span>`).join("")
+    : "";
 
-  // Map link in transport
+  // Map link
   if (mapUrl) {
     els.mapLink.href = mapUrl;
     els.mapLink.textContent = `map #${replay.mapPageId} ↗`;
@@ -1222,22 +1080,26 @@ function setLoadedState(loaded) {
 }
 
 function fmtTime(ms) {
-  const s = Math.floor(ms / 1000);
+  const safe = Math.max(0, ms || 0);
+  const s = Math.floor(safe / 1000);
   const m = Math.floor(s / 60);
   const ss = String(s % 60).padStart(2, "0");
-  return `${m}:${ss}`;
+  const mm = String(m).padStart(2, "0");
+  return `${mm}:${ss}`;
 }
 
 function updateTimeUI() {
   const replay = state.replay;
-  if (!replay || replay.samples.length === 0) {
-    els.timeLabel.textContent = "0:00 / 0:00";
-    els.seek.value = "0";
+  if (!replay || replay.frameCount === 0) {
+    els.timeLabel.textContent = "00:00 / 00:00";
+    if (els.progressFill) els.progressFill.style.width = "0%";
     return;
   }
   const end = state.durationMs;
   const safeEnd = Math.max(1, end);
-  els.seek.value = String(Math.min(1, Math.max(0, state.currentMs / safeEnd)));
+  const pct = Math.min(1, Math.max(0, state.currentMs / safeEnd));
+  if (els.seek) els.seek.value = String(pct);
+  if (els.progressFill) els.progressFill.style.width = (pct * 100).toFixed(2) + "%";
   els.timeLabel.textContent = `${fmtTime(state.currentMs)} / ${fmtTime(end)}`;
 }
 
@@ -1253,28 +1115,121 @@ function tick(ts) {
       state.currentMs = end;
       state.isPlaying = false;
       els.playPause.innerHTML = "&#9654;";
+      if (state.audio) { try { state.audio.pause(); } catch {} }
     }
-
   }
 
+  // Keep audio in sync (rate + drift correction)
+  if (state.audio && state.audioReady) syncAudioToTimeline(false);
+
+  updateStatsUI();
   updateTimeUI();
   drawReplay();
   requestAnimationFrame(tick);
 }
 
+/** Map an accuracy 0..1 to an SS-style letter rank. */
+function accuracyToRank(accFraction) {
+  if (!Number.isFinite(accFraction)) return "D";
+  if (accFraction >= 1.0)   return "SS";
+  if (accFraction >= 0.95)  return "S";
+  if (accFraction >= 0.90)  return "A";
+  if (accFraction >= 0.80)  return "B";
+  if (accFraction >= 0.70)  return "C";
+  return "D";
+}
+
+/** Update combo / score / accuracy / misses / rank / health based on notes whose hit time has passed. */
+function updateStatsUI() {
+  const replay = state.replay;
+  if (!replay || !replay.notes || !replay.noteHits) return;
+  const speedScale = replay.notesTimeScale || 1;
+  const tNow = replayMs();
+
+  let hits = 0;
+  let misses = 0;
+  let combo = 0;
+  let processed = 0;
+  for (let i = 0; i < replay.notes.length; i++) {
+    const tHit = replay.notes[i].ms * speedScale;
+    if (tHit > tNow) break;
+    processed++;
+    const v = replay.noteHits[i];
+    if (v === "hit") { hits++; combo++; }
+    else { misses++; combo = 0; }
+  }
+
+  // SS-style scoring approximation: 1000 per hit + small combo bonus.
+  const score = hits * 1000 + Math.min(combo, 64) * 5 * hits;
+  const accFrac = processed > 0 ? hits / processed : 0;
+
+  // Health: starts full, each miss subtracts ~3.5%, each hit recovers ~0.7%.
+  // No-fail mod prevents bottoming out from killing playback (we just clamp >= 0).
+  let health = 100 - misses * 3.5 + hits * 0.7;
+  if (health < 0) health = 0;
+  if (health > 100) health = 100;
+
+  if (els.comboVal)     els.comboVal.textContent     = combo + "x";
+  if (els.scoreVal)     els.scoreVal.textContent     = String(score);
+  if (els.missVal)      els.missVal.textContent      = String(misses);
+  if (els.accVal)       els.accVal.textContent       = (processed > 0 ? (accFrac * 100).toFixed(1) : "0") + "%";
+  if (els.rankVal)      els.rankVal.textContent      = accuracyToRank(accFrac);
+  // X/Y where Y is the number of notes the player has reached so far
+  // (hits + misses), NOT the total in the song. Mirrors how Rhythia's HUD
+  // counts in real time.
+  if (els.noteCountVal) els.noteCountVal.textContent = `${hits}/${hits + misses}`;
+  if (els.pointsVal)    els.pointsVal.textContent    = "\u2014"; // pp not derivable from .rhr yet
+  if (els.healthFill) {
+    els.healthFill.style.width = health.toFixed(1) + "%";
+    els.healthFill.style.background = health < 25 ? "#ff7785" : health < 55 ? "#f7c08a" : "#4ade80";
+  }
+
+  // Trigger a flash any time the miss tally grows. The render loop reads
+  // state.missFlashAt and animates the MISSES panel.
+  if (misses > state.lastMissCount) {
+    state.missFlashAt = performance.now();
+  }
+  state.lastMissCount = misses;
+}
+
+/** Time in the underlying replay (sample/note timeline) given the playhead.
+ *  The playhead lives in an extended timeline that includes a pre-roll and
+ *  post-roll grace period; clamped so the cursor stays put during silence. */
+function replayMs() {
+  const replay = state.replay;
+  if (!replay) return 0;
+  const raw = state.currentMs - state.gracePreMs;
+  const sampleEnd = replay.lastFrameMs;
+  if (raw < 0) return 0;
+  if (raw > sampleEnd) return sampleEnd;
+  return raw;
+}
+
 async function loadReplayFile(file) {
   const buffer = await file.arrayBuffer();
   const replay = parseRhr(buffer);
+  // Stop and tear down any prior audio so a new file gets a clean slate
+  teardownAudio();
   state.replay = replay;
-  state.durationMs = replay.samples.length ? replay.samples[replay.samples.length - 1].t : 0;
+  const sampleEnd = replay.lastFrameMs;
+  state.durationMs = sampleEnd + state.gracePreMs + state.gracePostMs;
   state.currentMs = 0;
   state.isPlaying = false;
+  state.pauseCount = 0;
+  state.lastMissCount = 0;
+  state.missFlashAt = 0;
+  if (els.pauseVal) els.pauseVal.textContent = "0";
   els.playPause.innerHTML = "&#9654;";
   renderMeta(replay);
   setLoadedState(true);
   els.dropZone.classList.add("hidden");
   updateTimeUI();
   drawReplay();
+
+  // Asynchronously fetch and decode the beatmap so we can render notes.
+  loadMapNotes(replay).then(() => {
+    if (state.replay === replay) drawReplay();
+  }).catch((err) => console.warn("Map notes unavailable:", err));
 }
 
 function attachDnD() {
@@ -1323,21 +1278,99 @@ function attachDnD() {
   });
 }
 
+function togglePlayback() {
+  if (!state.replay) return;
+  // Pause counter only ticks when the user pauses an active playback
+  // (not when they press play to start). This mirrors how Rhythia counts
+  // user-triggered pauses during a run.
+  const willPause = state.isPlaying;
+  state.isPlaying = !state.isPlaying;
+  els.playPause.innerHTML = state.isPlaying ? "&#9646;&#9646;" : "&#9654;";
+  if (willPause) {
+    state.pauseCount += 1;
+    if (els.pauseVal) els.pauseVal.textContent = String(state.pauseCount);
+  }
+  if (state.audio && state.audioReady) syncAudioToTimeline(true);
+}
+
 function attachControls() {
-  els.playPause.addEventListener("click", () => {
+  // Play button is gone — click anywhere on the canvas (above the seek
+  // bar) to toggle playback. The toolbar still has a hidden #playPause
+  // node; we just don't bind a click listener to it.
+
+  // Canvas click → toggle playback (but only when not interacting with the
+  // seek bar, which has its own pointer handlers below).
+  els.canvas.addEventListener("click", (e) => {
+  if (!state.replay) return;
+    const rect = els.canvas.getBoundingClientRect();
+    const dpr = els.canvas.width / rect.width;
+    const cx = (e.clientX - rect.left) * dpr;
+    const cy = (e.clientY - rect.top) * dpr;
+    const sb = state.seekBarRect;
+    if (sb && cx >= sb.x && cx <= sb.x + sb.w && cy >= sb.y - 12 && cy <= sb.y + sb.h + 12) {
+      return; // seek bar handles this
+    }
+    togglePlayback();
+  });
+
+  // Seek bar drag handling (pointer-based for canvas)
+  let dragging = false;
+  const seekFromEvent = (e) => {
+    const rect = els.canvas.getBoundingClientRect();
+    const dpr = els.canvas.width / rect.width;
+    const cx = (e.clientX - rect.left) * dpr;
+    const sb = state.seekBarRect;
+    if (!sb) return;
+    const t = Math.max(0, Math.min(1, (cx - sb.x) / sb.w));
+    state.currentMs = t * state.durationMs;
+    if (state.audio && state.audioReady) syncAudioToTimeline(true);
+    updateTimeUI();
+    drawReplay();
+  };
+  els.canvas.addEventListener("pointerdown", (e) => {
     if (!state.replay) return;
-    state.isPlaying = !state.isPlaying;
-    els.playPause.innerHTML = state.isPlaying ? "&#9646;&#9646;" : "&#9654;";
+    const rect = els.canvas.getBoundingClientRect();
+    const dpr = els.canvas.width / rect.width;
+    const cx = (e.clientX - rect.left) * dpr;
+    const cy = (e.clientY - rect.top) * dpr;
+    const sb = state.seekBarRect;
+    if (!sb) return;
+    if (cx >= sb.x && cx <= sb.x + sb.w && cy >= sb.y - 12 && cy <= sb.y + sb.h + 12) {
+      dragging = true;
+      els.canvas.setPointerCapture(e.pointerId);
+      seekFromEvent(e);
+    }
+  });
+  els.canvas.addEventListener("pointermove", (e) => {
+    if (dragging) seekFromEvent(e);
+  });
+  els.canvas.addEventListener("pointerup", (e) => {
+    if (dragging) {
+      dragging = false;
+      try { els.canvas.releasePointerCapture(e.pointerId); } catch {}
+    }
+  });
+
+  // Spacebar = play/pause, matching the in-game shortcut. Ignored while
+  // typing into form inputs so we don't hijack other UI.
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== "Space") return;
+    const tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    e.preventDefault();
+    togglePlayback();
   });
 
   els.speed.addEventListener("change", () => {
     state.speed = Number(els.speed.value);
+    if (state.audio && state.audioReady) syncAudioToTimeline(true);
   });
 
   els.seek.addEventListener("input", () => {
-    if (!state.replay || state.replay.samples.length === 0) return;
+    if (!state.replay || state.replay.frameCount === 0) return;
     const end = state.durationMs;
     state.currentMs = Number(els.seek.value) * end;
+    if (state.audio && state.audioReady) syncAudioToTimeline(true);
     drawReplay();
     updateTimeUI();
   });
