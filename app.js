@@ -38,6 +38,8 @@ window.__rvState = state;
 
 const RAW_FRAME_MS = 1000 / 60;
 
+const DISPLAY_MARGIN = 0.08;
+
 function readU8(view, off) {
   return view.getUint8(off);
 }
@@ -131,6 +133,8 @@ function parseRhr(buffer) {
     offObj.off += frameCount;
   }
 
+  const samples = buildPlaybackSamples(frames, frameFlags, mapLengthSec);
+
   return {
     magic,
     rawTimestamp,
@@ -147,7 +151,8 @@ function parseRhr(buffer) {
     frameCount,
     frames,
     frameFlags,
-    samples: buildPlaybackSamples(frames, frameFlags, mapLengthSec),
+    samples,
+    displayTransform: createDisplayTransform(samples),
     unknownA,
     unknownB,
     unknownC,
@@ -762,6 +767,76 @@ function buildPlaybackSamples(frames, frameFlags, mapLengthSec) {
   return candidates[0];
 }
 
+function createDisplayTransform(samples) {
+  if (!samples || !samples.length) {
+    return {
+      xLo: 0,
+      xHi: 1,
+      yLo: 0,
+      yHi: 1,
+      invertY: false,
+      outMin: DISPLAY_MARGIN,
+      outMax: 1 - DISPLAY_MARGIN,
+    };
+  }
+
+  const xs = [];
+  const ys = [];
+  for (let i = 0; i < samples.length; i++) {
+    const p = samples[i];
+    if (!Number.isFinite(p.xNorm) || !Number.isFinite(p.yNorm)) continue;
+    xs.push(p.xNorm);
+    ys.push(p.yNorm);
+  }
+
+  if (!xs.length || !ys.length) {
+    return {
+      xLo: 0,
+      xHi: 1,
+      yLo: 0,
+      yHi: 1,
+      invertY: false,
+      outMin: DISPLAY_MARGIN,
+      outMax: 1 - DISPLAY_MARGIN,
+    };
+  }
+
+  const xLo = percentile(xs, 0.03);
+  const xHi = percentile(xs, 0.97);
+  const yLo = percentile(ys, 0.03);
+  const yHi = percentile(ys, 0.97);
+
+  const yMean = ys.reduce((a, b) => a + b, 0) / ys.length;
+  // Rhythia replays generally place center near 0.5; choose orientation that keeps mean near center.
+  const invertY = Math.abs((1 - yMean) - 0.5) < Math.abs(yMean - 0.5);
+
+  return {
+    xLo,
+    xHi: Math.max(xLo + 1e-4, xHi),
+    yLo,
+    yHi: Math.max(yLo + 1e-4, yHi),
+    invertY,
+    outMin: DISPLAY_MARGIN,
+    outMax: 1 - DISPLAY_MARGIN,
+  };
+}
+
+function applyDisplayTransform(xNorm, yNorm, transform) {
+  if (!transform) {
+    return { x: clamp01(xNorm), y: clamp01(yNorm) };
+  }
+
+  const outSpan = Math.max(1e-6, transform.outMax - transform.outMin);
+  const fitX = transform.outMin + remapByRange(xNorm, transform.xLo, transform.xHi) * outSpan;
+  const fitY = transform.outMin + remapByRange(yNorm, transform.yLo, transform.yHi) * outSpan;
+  const y = transform.invertY ? 1 - fitY : fitY;
+
+  return {
+    x: clamp01(fitX),
+    y: clamp01(y),
+  };
+}
+
 function safeJsonParse(value, fallback) {
   try {
     return JSON.parse(value);
@@ -819,9 +894,9 @@ const GRID_HALF = 1.5;
 const NOTE_SPAWN_Z = 22;
 
 // Fixed perspective camera
-const CAM_POS  = { x: 0, y: 1.5, z: -3.5 };
-const CAM_LOOK = { x: 0, y: 0,   z: 10  };
-const CAM_FOV  = 65; // degrees
+const CAM_POS  = { x: 0, y: 2.15, z: -5.4 };
+const CAM_LOOK = { x: 0, y: -0.25, z: 9.2 };
+const CAM_FOV  = 62; // degrees
 
 let _camBasis = null;
 
@@ -1031,7 +1106,8 @@ function drawReplay() {
 
   // Sample cursor position and project onto hit plane (z = 0)
   const sample = sampleCursor(replay.samples, state.currentMs);
-  const { wx, wy, wz } = cursorToWorld(sample.xNorm, sample.yNorm);
+  const displayPoint = applyDisplayTransform(sample.xNorm, sample.yNorm, replay.displayTransform);
+  const { wx, wy, wz } = cursorToWorld(displayPoint.x, displayPoint.y);
   const proj = project3D(wx, wy, wz, w, h);
   if (!proj) return;
 
