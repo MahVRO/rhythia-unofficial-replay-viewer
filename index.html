@@ -40,6 +40,7 @@
   <!-- Bottom transport dock: file + speed + interactive progress bar -->
   <div class="transport-dock" id="transportFloating">
     <button class="btn-icon" id="openFile" title="Open replay">&#128194;</button>
+    <button class="btn-icon" id="viewerSettingsBtn" title="Viewer settings">&#9881;</button>
     <button id="playPause" disabled title="Play / pause">&#9654;</button>
     <select id="speed" class="speed-select" disabled title="Playback speed">
       <option value="0.25">0.25x</option>
@@ -49,15 +50,102 @@
       <option value="1.5">1.5x</option>
       <option value="2">2x</option>
     </select>
-    <input id="seek" class="ipb-slider" type="range" min="0" max="1" step="0.0001" value="0" disabled />
+    <div class="ipb-wrap">
+      <div id="seekMarkers" class="ipb-markers" aria-hidden="true"></div>
+      <input id="seek" class="ipb-slider" type="range" min="0" max="1" step="0.0001" value="0" disabled />
+    </div>
   </div>
 
-  <!-- Drop zone overlay (initial state) -->
-  <section id="dropZone" class="dropzone" tabindex="0" role="button" aria-label="Drop replay file here">
-    <div class="dropzone-inner">
-      <div class="drop-icon">&#9654;</div>
-      <p class="drop-title">Drop .rhr replay file</p>
-      <p class="drop-subtitle">or click to browse</p>
+  <section id="settingsPanel" class="settings-panel hidden" aria-label="Viewer settings">
+    <div class="rv-settings">
+      <div class="rv-tabs" role="tablist" aria-label="Settings sections">
+        <button id="setTabMain" class="rv-tab active" type="button" role="tab" aria-selected="true">Main</button>
+        <button id="setTabMarkers" class="rv-tab" type="button" role="tab" aria-selected="false">Markers</button>
+        <button id="setTabCustomize" class="rv-tab" type="button" role="tab" aria-selected="false">Customize</button>
+      </div>
+
+      <div id="settingsMainPanel" class="rv-panel" role="tabpanel">
+
+        <label class="rv-row" title="Show missed notes with a red cross in the middle.">
+          <span>Highlight misses</span>
+          <span class="rv-toggle">
+            <input id="setHighlightMisses" type="checkbox" />
+            <span class="rv-toggle-pill" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <label class="rv-row" title="Show current browser replay fps on the top right.">
+          <span>Show fps</span>
+          <span class="rv-toggle">
+            <input id="setShowFps" type="checkbox" />
+            <span class="rv-toggle-pill" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <label class="rv-slider" title="How far notes come, in milliseconds.">
+          <span>Reaction time: <strong id="setReactionTimeVal">500 ms</strong></span>
+          <input id="setReactionTime" type="range" min="200" max="1200" step="10" value="500" />
+        </label>
+
+        <label class="rv-row" title="Toggle HUD visibility.">
+          <span>Show HUD</span>
+          <span class="rv-toggle">
+            <input id="setShowHud" type="checkbox" checked />
+            <span class="rv-toggle-pill" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <label class="rv-row" title="Toggle cursor visibility.">
+          <span>Show cursor</span>
+          <span class="rv-toggle">
+            <input id="setShowCursor" type="checkbox" checked />
+            <span class="rv-toggle-pill" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <label class="rv-row" title="Toggle notes visibility.">
+          <span>Show notes</span>
+          <span class="rv-toggle">
+            <input id="setShowNotes" type="checkbox" checked />
+            <span class="rv-toggle-pill" aria-hidden="true"></span>
+          </span>
+        </label>
+      </div>
+
+      <div id="settingsMarkersPanel" class="rv-panel hidden" role="tabpanel">
+        <label class="rv-row" title="Show red bars on the IPB timeline at miss timestamps.">
+          <span>Misses</span>
+          <span class="rv-toggle">
+            <input id="setMarkerMisses" type="checkbox" checked />
+            <span class="rv-toggle-pill" aria-hidden="true"></span>
+          </span>
+        </label>
+
+        <label class="rv-row" title="Show bars on the IPB timeline at replay pause timestamps.">
+          <span>Pauses</span>
+          <span class="rv-toggle">
+            <input id="setMarkerPauses" type="checkbox" checked />
+            <span class="rv-toggle-pill" aria-hidden="true"></span>
+          </span>
+        </label>
+      </div>
+
+      <div id="settingsCustomizePanel" class="rv-panel hidden" role="tabpanel">
+        <label class="rv-slider" title="Adjust opacity of left/right HUD side panels.">
+          <span>Side panel opacity: <strong id="setSidePanelOpacityVal">50%</strong></span>
+          <input id="setSidePanelOpacity" type="range" min="0" max="100" step="1" value="50" />
+        </label>
+
+        <div class="rv-row" title="Choose the cursor color in the replay view.">
+          <span>Cursor color</span>
+          <input id="setCursorColor" class="rv-color" type="color" value="#ffffff" aria-label="Cursor color" />
+        </div>
+
+        <div class="rv-row" title="Choose the note color in the replay view.">
+          <span>Notes color</span>
+          <input id="setNotesColor" class="rv-color" type="color" value="#6ec3ff" aria-label="Notes color" />
+        </div>
+      </div>
     </div>
   </section>
 
