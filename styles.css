@@ -7,6 +7,10 @@
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
+/* Quick note:
+ * This CSS assumes a fullscreen canvas stage.
+ * If layout scope changes, keep ids/classes used by app.js aligned. */
+
 html, body {
   width: 100%; height: 100%;
   overflow: hidden;
@@ -15,9 +19,8 @@ html, body {
   color: var(--ink);
 }
 
-/* The HUD is rendered ENTIRELY inside the 3D canvas. The HTML stat
- * elements live in a hidden #hud-data block; the canvas reads their
- * textContent / inline style each frame. */
+/* HUD is fully canvas-rendered.
+ * #hud-data holds the values that canvas reads each frame. */
 .layout {
   position: fixed;
   inset: 0;
@@ -36,7 +39,7 @@ canvas {
   background: var(--bg-deep);
 }
 
-/* Bottom transport dock (merged controls + IPB) */
+/* Bottom transport dock */
 .transport-dock {
   position: fixed;
   left: 50%;
@@ -54,32 +57,85 @@ canvas {
   min-width: min(920px, calc(100vw - 24px));
 }
 
+/* Play/pause stays in DOM for state compatibility.
+ * UX uses canvas click + Space instead. */
 #playPause { display: none !important; }
 
 .btn-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
   background: none;
   border: none;
   color: var(--ink);
-  font-size: 1.1rem;
   cursor: pointer;
-  padding: 4px 6px;
+  padding: 3px;
   border-radius: 6px;
   opacity: 0.75;
-  transition: opacity 120ms;
+  transition: opacity 120ms, background 120ms;
 }
 .btn-icon:hover { opacity: 1; }
 
-.speed-select {
-  background: rgba(255,255,255,0.07);
-  border: 1px solid rgba(255,255,255,0.18);
-  color: var(--ink);
-  font-family: inherit;
-  font-size: 0.78rem;
-  border-radius: 6px;
-  padding: 3px 6px;
-  cursor: pointer;
+.btn-icon:focus-visible {
+  outline: 1px solid rgba(255,255,255,0.35);
+  outline-offset: 1px;
 }
-.speed-select:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.btn-icon-img {
+  width: 18px;
+  height: 18px;
+  display: block;
+  color: rgba(255,255,255,0.95);
+  opacity: 0.95;
+}
+
+.speed-box {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.speed-label {
+  min-width: 30px;
+  text-align: center;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: rgba(255,255,255,0.75);
+  cursor: text;
+  padding: 2px 4px;
+  border-radius: 4px;
+  transition: background 100ms;
+}
+.speed-label:hover { background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.95); }
+
+.speed-input {
+  width: 34px;
+  text-align: center;
+  font-size: 0.78rem;
+  font-weight: 600;
+  font-family: inherit;
+  color: rgba(255,255,255,0.95);
+  background: rgba(255,255,255,0.1);
+  border: 1px solid rgba(255,255,255,0.3);
+  border-radius: 4px;
+  padding: 1px 3px;
+  outline: none;
+}
+
+.speed-arrow {
+  background: none;
+  border: none;
+  color: var(--ink);
+  font-size: 0.6rem;
+  padding: 2px 3px;
+  cursor: pointer;
+  opacity: 0.45;
+  transition: opacity 100ms;
+}
+
+.speed-arrow:hover:not(:disabled) { opacity: 0.9; }
+.speed-arrow:disabled { opacity: 0.18; cursor: not-allowed; }
 
 .ipb-wrap {
   flex: 1;
@@ -150,6 +206,17 @@ canvas {
   cursor: not-allowed;
 }
 
+@media (max-width: 920px) {
+  .transport-dock {
+    flex-wrap: wrap;
+  }
+
+  .speed-box,
+  .ipb-wrap {
+    width: 100%;
+  }
+}
+
 .settings-panel {
   position: fixed;
   left: 16px;
@@ -157,6 +224,8 @@ canvas {
   z-index: 7;
   width: min(300px, calc(100vw - 32px));
 }
+
+/* Settings visibility is toggled by JS via .hidden. */
 
 .rv-settings {
   border: 1px solid rgba(255,255,255,0.1);

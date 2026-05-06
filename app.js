@@ -1,3 +1,5 @@
+// DOM map for index.html ids.
+// If markup moves, update this in one pass.
 const els = {
   fileInput: document.getElementById("fileInput"),
   openFile: document.getElementById("openFile"),
@@ -24,7 +26,10 @@ const els = {
   setNotesColor: document.getElementById("setNotesColor"),
   canvas: document.getElementById("view"),
   playPause: document.getElementById("playPause"),
-  speed: document.getElementById("speed"),
+  speedCurrent: document.getElementById("speedCurrent"),
+  speedInput: document.getElementById("speedInput"),
+  speedDown: document.getElementById("speedDown"),
+  speedUp: document.getElementById("speedUp"),
   seek: document.getElementById("seek"),
   seekMarkers: document.getElementById("seekMarkers"),
   timeLabel: document.getElementById("timeLabel"),
@@ -49,6 +54,8 @@ const els = {
 
 const ctx = els.canvas.getContext("2d");
 
+// Runtime state.
+// Timeline values are milliseconds.
 const state = {
   replay: null,
   isPlaying: false,
@@ -68,6 +75,12 @@ const state = {
   mapUrl: null,          // active map URL for song-title click target
   songTitleHover: false,
   songTitleHitbox: null,
+  playfieldHitbox: null,
+  dragFileOverWindow: false,
+  dragFileOverGrid: false,
+  loadingActive: false,
+  loadingLabel: "",
+  loadingProgress: 0,
   fpsSmoothed: 0,
   viewerSettings: null,
   settingsOpen: false,
@@ -76,6 +89,13 @@ const state = {
 
 const VIEWER_SETTINGS_KEY = "rvViewerSettingsV2";
 const DEFAULT_STAGE_BG = "rgb(5, 10, 15)";
+const RHR_MAGIC = 20260222;
+const RHR_FRAME_STRIDE_BYTES = 17;
+const NOTE_HIT_TOLERANCE_MS = 60;
+const PAUSE_GAP_MS = 120;
+const AUDIO_DRIFT_RESYNC_SEC = 0.12;
+// Keep this in one place so endpoint swaps are easy.
+const RHYTHIA_API_BEATMAP_PAGE_URL = "https://production.rhythia.com/api/getBeatmapPage";
 const DEFAULT_VIEWER_SETTINGS = {
   highlightMisses: true,
   showFps: false,
@@ -143,9 +163,13 @@ function saveViewerSettings() {
 
 state.viewerSettings = loadViewerSettings();
 
-window.__rvState = state;
-
 const RAW_FRAME_MS = 1000 / 60;
+
+function ensureRemainingBytes(view, off, needed, label) {
+  if (off + needed > view.byteLength) {
+    throw new Error(`Malformed replay: unexpected end of file while reading ${label}.`);
+  }
+}
 
 function readU8(view, off) {
   return view.getUint8(off);
@@ -176,55 +200,83 @@ function readF32(view, off) {
 }
 
 function readStr8(view, offObj) {
+  ensureRemainingBytes(view, offObj.off, 1, "string length");
   const len = readU8(view, offObj.off);
   offObj.off += 1;
+  ensureRemainingBytes(view, offObj.off, len, "string payload");
   const bytes = new Uint8Array(view.buffer, offObj.off, len);
   offObj.off += len;
   return new TextDecoder().decode(bytes);
 }
 
 function parseRhr(buffer) {
+  if (!(buffer instanceof ArrayBuffer)) {
+    throw new Error("Malformed replay: expected binary ArrayBuffer input.");
+  }
+
   const view = new DataView(buffer);
   const offObj = { off: 0 };
 
+  ensureRemainingBytes(view, offObj.off, 4, "magic");
   const magic = readU32(view, offObj.off);
   offObj.off += 4;
-  if (magic !== 20260222) {
-    throw new Error("Unsupported replay magic. Expected 20260222 (.rhr)." );
+  if (magic !== RHR_MAGIC) {
+    throw new Error(`Unsupported replay magic. Expected ${RHR_MAGIC} (.rhr).`);
   }
 
+  ensureRemainingBytes(view, offObj.off, 8, "timestamp");
   const rawTimestamp = readI64(view, offObj.off);
   offObj.off += 8;
 
   const mode = readStr8(view, offObj);
   const mapId = readStr8(view, offObj);
+  ensureRemainingBytes(view, offObj.off, 8, "map page id");
   const mapPageId = Number(readI64(view, offObj.off));
   offObj.off += 8;
   const profileType = readStr8(view, offObj);
+  ensureRemainingBytes(view, offObj.off, 1, "profile flag");
   const profileFlag = readU8(view, offObj.off);
   offObj.off += 1;
   const modsJson = readStr8(view, offObj);
 
+  ensureRemainingBytes(view, offObj.off, 1, "replay status");
   const replayStatus = readU8(view, offObj.off);
   offObj.off += 1;
+  ensureRemainingBytes(view, offObj.off, 4, "accuracy");
   const accuracy = readF32(view, offObj.off);
   offObj.off += 4;
+  ensureRemainingBytes(view, offObj.off, 8, "unknownA");
   const unknownA = readU64(view, offObj.off);
   offObj.off += 8;
+  ensureRemainingBytes(view, offObj.off, 4, "map length");
   const mapLengthSec = readF32(view, offObj.off);
   offObj.off += 4;
+  ensureRemainingBytes(view, offObj.off, 4, "note count");
   const noteCount = readU32(view, offObj.off);
   offObj.off += 4;
+  ensureRemainingBytes(view, offObj.off, 4, "unknownB");
   const unknownB = readU32(view, offObj.off);
   offObj.off += 4;
+  ensureRemainingBytes(view, offObj.off, 4, "unknownC");
   const unknownC = readF32(view, offObj.off);
   offObj.off += 4;
+  ensureRemainingBytes(view, offObj.off, 4, "unknownD");
   const unknownD = readI32(view, offObj.off);
   offObj.off += 4;
+  ensureRemainingBytes(view, offObj.off, 4, "frame count");
   const frameCount = readU32(view, offObj.off);
   offObj.off += 4;
 
-  // Frame layout (confirmed by Rhythia dev):
+  if (!Number.isFinite(mapLengthSec) || mapLengthSec < 0) {
+    throw new Error("Malformed replay: map length is invalid.");
+  }
+
+  const requiredFrameBytes = frameCount * RHR_FRAME_STRIDE_BYTES;
+  if (requiredFrameBytes > view.byteLength - offObj.off) {
+    throw new Error("Malformed replay: frame data is shorter than declared frame count.");
+  }
+
+  // Frame layout expected by this parser:
   //   Time      f32   replay-time milliseconds
   //   PositionX f32   cursor X in world units (centered, about +/- GRID_HALF)
   //   PositionY f32   cursor Y in world units (centered, about +/- GRID_HALF)
@@ -233,16 +285,17 @@ function parseRhr(buffer) {
   // Frames are INTERLEAVED, 17 bytes each, no separate flag block.
   const frames = new Array(frameCount);
   for (let i = 0; i < frameCount; i++) {
+    ensureRemainingBytes(view, offObj.off, RHR_FRAME_STRIDE_BYTES, `frame ${i}`);
     const t      = readF32(view, offObj.off);
     const x      = readF32(view, offObj.off + 4);
     const y      = readF32(view, offObj.off + 8);
     const health = readF32(view, offObj.off + 12);
     const isHit  = readU8(view, offObj.off + 16) !== 0;
     frames[i] = { t, x, y, health, isHit };
-    offObj.off += 17;
+    offObj.off += RHR_FRAME_STRIDE_BYTES;
   }
 
-  // Last replay-time millisecond from the actual frame timestamps.
+  // Last replay-time ms from frame data.
   const lastFrameMs = frameCount > 0 ? frames[frameCount - 1].t : 0;
 
   return {
@@ -281,7 +334,7 @@ function safeJsonParse(value, fallback) {
   }
 }
 
-// 3D rendering system.
+// 3D rendering.
 
 // World dimensions: the hit plane is a flat square +/- GRID_HALF in x and y, at z = 0.
 // Notes (when added) will spawn at NOTE_SPAWN_Z and travel toward z = 0.
@@ -293,9 +346,7 @@ const NOTE_PRE_HIT_FADE_MS = 50; // fade out during final approach before impact
 const NOTE_MISS_PAST_MS = 20; // missed notes continue past the grid for a brief time
 // Hit radius is approximated from projected cell size in drawNotes().
 
-// Fixed perspective camera. Straight-on Rhythia POV: dead center, level
-// (no pitch). Pulled back ~20% from the original distance for a wider
-// view of the playfield.
+// Fixed perspective camera centered on the playfield.
 const CAM_POS  = { x: 0, y: 0, z: -4.6 };
 const CAM_LOOK = { x: 0, y: 0, z: 1 };
 const CAM_FOV  = 55; // degrees
@@ -378,7 +429,7 @@ function drawLine3D(ax, ay, az, bx, by, bz, canvasW, canvasH) {
 // Notes (SSPM v2).
 
 /**
- * Parse a Sound Space Plus Map v2 file.
+ * Parse an SSPM v2 map file.
  * Returns { notes: [{ ms, x, y }], lastMs, noteCount, audioBytes, audioMime }.
  * x,y are in [0,2] grid coords (integer mode) or floats (decimal mode).
  */
@@ -444,13 +495,21 @@ function detectAudioMime(bytes) {
   if (bytes.length >= 2 && bytes[0] === 0xFF && (bytes[1] & 0xE0) === 0xE0) return "audio/mpeg"; // raw MP3 frame
   if (bytes.length >= 4 && bytes[0] === 0x4F && bytes[1] === 0x67 && bytes[2] === 0x67 && bytes[3] === 0x53) return "audio/ogg"; // OggS
   if (bytes.length >= 4 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) return "audio/wav"; // RIFF
+  if (bytes.length >= 4 && bytes[0] === 0x66 && bytes[1] === 0x4C && bytes[2] === 0x61 && bytes[3] === 0x43) return "audio/flac"; // fLaC
+  if (bytes.length >= 12 && bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) {
+    const brand = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]).toLowerCase();
+    if (brand.startsWith("m4a") || brand === "mp4 " || brand.startsWith("isom") || brand.startsWith("iso2")) {
+      return "audio/mp4";
+    }
+  }
   return "audio/mpeg";
 }
 
-/** Fetch the beatmap page from Rhythia's API and download + parse the .sspm. */
+/** Fetch beatmap page data and parse the .sspm. */
 async function fetchMapAssets(mapPageId) {
+  // Intentionally direct call so request flow stays easy to change.
   if (!Number.isFinite(mapPageId) || mapPageId <= 0) return null;
-  const apiRes = await fetch("https://production.rhythia.com/api/getBeatmapPage", {
+  const apiRes = await fetch(RHYTHIA_API_BEATMAP_PAGE_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id: mapPageId, session: "" }),
@@ -467,8 +526,8 @@ async function fetchMapAssets(mapPageId) {
 }
 
 /** Convert SSPM grid coordinates (x,y in [0,2]) to world coords on the hit plane.
- *  In Sound Space, x=0,1,2 are *cell centers*, not the outer edges of the playfield.
- *  So a 3-cell grid with half-extent GRID_HALF puts cells at +/- (2/3) * GRID_HALF and 0. */
+ *  x=0,1,2 are treated as cell centers, not outer edges.
+ *  A 3-cell grid with half-extent GRID_HALF maps to +/- (2/3) * GRID_HALF and 0. */
 function noteToWorld(x, y) {
   const CELL = (2 * GRID_HALF) / 3;
   return {
@@ -523,17 +582,16 @@ function computeNoteHits(replay, speedScale) {
   // Walk both lists in order. Note timing is in song-time ms, and the
   // replay's IsHit frames are also recorded in song-time, so the two line
   // up directly without applying speedScale.
-  const TOLERANCE_MS = 60;
   let hi = 0;
   for (let ni = 0; ni < notes.length && hi < hitTimes.length; ni++) {
     const noteT = notes[ni].ms;
     const ht = hitTimes[hi];
-    if (ht < noteT - TOLERANCE_MS) {
+    if (ht < noteT - NOTE_HIT_TOLERANCE_MS) {
       hi++;
       ni--;
       continue;
     }
-    if (Math.abs(ht - noteT) <= TOLERANCE_MS) {
+    if (Math.abs(ht - noteT) <= NOTE_HIT_TOLERANCE_MS) {
       out[ni] = "hit";
       hi++;
     }
@@ -561,6 +619,11 @@ async function loadMapNotes(replay) {
     if (els.missVal) els.missVal.textContent = String(misses);
   }
 
+  // Update song name from the properly-cased API title.
+  if (data.beatmap?.title && state.replay === replay) {
+    els.songName.textContent = data.beatmap.title;
+  }
+
   // Wire audio if the SSPM provided it.
   if (data.audioBytes && data.audioBytes.length > 0) {
     setupAudio(data.audioBytes, data.audioMime, speedScale);
@@ -572,29 +635,94 @@ function setupAudio(bytes, mime, notesTimeScale) {
   // Tear down any previous audio first
   teardownAudio();
 
-  const blob = new Blob([bytes], { type: mime || "audio/mpeg" });
-  const url = URL.createObjectURL(blob);
+  const detectedMime = detectAudioMime(bytes);
+  const candidates = [
+    mime,
+    detectedMime,
+    "audio/mp4",
+    "audio/aac",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/wav",
+    "audio/flac",
+    "",
+  ];
+  const mimeCandidates = Array.from(new Set(candidates.filter((m) => typeof m === "string")));
+
   const audio = new Audio();
   audio.preload = "auto";
-  audio.src = url;
 
   state.audio = audio;
-  state.audioUrl = url;
+  state.audioUrl = null;
   state.audioReady = false;
   state.audioTimeScale = notesTimeScale || 1;
 
-  audio.addEventListener("loadedmetadata", () => {
+  let attempt = 0;
+  let currentMime = "";
+
+  const applyAttempt = () => {
+    if (state.audio !== audio) return;
+    if (attempt >= mimeCandidates.length) {
+      const err = audio.error;
+      const reason = err?.code === 1 ? "aborted"
+        : err?.code === 2 ? "network"
+        : err?.code === 3 ? "decode"
+        : err?.code === 4 ? "src-not-supported"
+        : "unknown";
+      const headerHex = Array.from(bytes.slice(0, 16)).map((b) => b.toString(16).padStart(2, "0")).join(" ");
+      console.warn("Audio failed to load", {
+        errorCode: err?.code || 0,
+        reason,
+        attemptedMimes: mimeCandidates,
+        bytes: bytes.length,
+        headerHex,
+      });
+      teardownAudio();
+      return;
+    }
+
+    currentMime = mimeCandidates[attempt++];
+    if (state.audioUrl) {
+      try { URL.revokeObjectURL(state.audioUrl); } catch {}
+      state.audioUrl = null;
+    }
+    const blob = currentMime ? new Blob([bytes], { type: currentMime }) : new Blob([bytes]);
+    const url = URL.createObjectURL(blob);
+    state.audioUrl = url;
+    audio.src = url;
+    audio.load();
+  };
+
+  const onLoadedMetadata = () => {
+    if (state.audio !== audio) return;
     state.audioReady = true;
     syncAudioToTimeline(true);
-  });
-  audio.addEventListener("error", () => {
-    console.warn("Audio failed to load");
-    teardownAudio();
-  });
+  };
+
+  const onError = () => {
+    if (state.audio !== audio) return;
+    // Try the next MIME guess before giving up.
+    applyAttempt();
+  };
+
+  audio.addEventListener("loadedmetadata", onLoadedMetadata);
+  audio.addEventListener("error", onError);
+  audio._rvOnLoadedMetadata = onLoadedMetadata;
+  audio._rvOnError = onError;
+
+  applyAttempt();
 }
 
 function teardownAudio() {
   if (state.audio) {
+    if (state.audio._rvOnLoadedMetadata) {
+      try { state.audio.removeEventListener("loadedmetadata", state.audio._rvOnLoadedMetadata); } catch {}
+      state.audio._rvOnLoadedMetadata = null;
+    }
+    if (state.audio._rvOnError) {
+      try { state.audio.removeEventListener("error", state.audio._rvOnError); } catch {}
+      state.audio._rvOnError = null;
+    }
     try { state.audio.pause(); } catch {}
     state.audio.src = "";
   }
@@ -623,7 +751,7 @@ function syncAudioToTimeline(force) {
   if (Math.abs(audio.playbackRate - desiredRate) > 0.001) {
     audio.playbackRate = Math.max(0.0625, Math.min(16, desiredRate));
   }
-  if (force || Math.abs(audio.currentTime - targetSec) > 0.12) {
+  if (force || Math.abs(audio.currentTime - targetSec) > AUDIO_DRIFT_RESYNC_SEC) {
     try { audio.currentTime = Math.max(0, Math.min(audio.duration || targetSec, targetSec)); } catch {}
   }
   // Hard-mute (and pause) during the pre/post-roll grace windows so the
@@ -766,14 +894,51 @@ function drawNotes(canvasW, canvasH) {
 
 function draw3DField(canvasW, canvasH) {
   const G = GRID_HALF;
-  // Match the real Rhythia HUD: no playfield fill (the bg is just black),
-  // no outer border, only four L-shaped corner brackets framing the
-  // projected hit plane.
+  // Draw a minimal field frame using four corner brackets.
   const tl = project3D(-G,  G, 0, canvasW, canvasH);
   const tr = project3D( G,  G, 0, canvasW, canvasH);
   const br = project3D( G, -G, 0, canvasW, canvasH);
   const bl = project3D(-G, -G, 0, canvasW, canvasH);
-  if (!tl || !tr || !br || !bl) return;
+  if (!tl || !tr || !br || !bl) {
+    state.playfieldHitbox = null;
+    return;
+  }
+
+  state.playfieldHitbox = {
+    x: Math.min(tl.px, tr.px, br.px, bl.px),
+    y: Math.min(tl.py, tr.py, br.py, bl.py),
+    w: Math.max(tl.px, tr.px, br.px, bl.px) - Math.min(tl.px, tr.px, br.px, bl.px),
+    h: Math.max(tl.py, tr.py, br.py, bl.py) - Math.min(tl.py, tr.py, br.py, bl.py),
+  };
+
+  if (state.dragFileOverWindow) {
+    const hb = state.playfieldHitbox;
+    const inset = Math.max(6, Math.min(hb.w, hb.h) * 0.045);
+    const boxX = hb.x + inset;
+    const boxY = hb.y + inset;
+    const boxW = Math.max(0, hb.w - inset * 2);
+    const boxH = Math.max(0, hb.h - inset * 2);
+    const radius = Math.max(10, Math.min(28, Math.min(boxW, boxH) * 0.1));
+    if (boxW <= 0 || boxH <= 0) return;
+
+    ctx.save();
+    if (state.dragFileOverGrid) {
+      ctx.fillStyle = "rgba(72, 188, 255, 0.22)";
+      ctx.strokeStyle = "rgba(140, 226, 255, 0.98)";
+      ctx.lineWidth = 3;
+      ctx.shadowColor = "rgba(77, 199, 255, 0.58)";
+      ctx.shadowBlur = 18;
+    } else {
+      ctx.fillStyle = "rgba(255, 255, 255, 0.08)";
+      ctx.strokeStyle = "rgba(188, 198, 214, 0.62)";
+      ctx.lineWidth = 2;
+      ctx.shadowBlur = 0;
+    }
+    roundRect(boxX, boxY, boxW, boxH, radius);
+    ctx.fill();
+    ctx.stroke();
+    ctx.restore();
+  }
 
   const armX = Math.max(20, Math.min(46, (tr.px - tl.px) * 0.055));
   const armY = Math.max(20, Math.min(46, (bl.py - tl.py) * 0.055));
@@ -827,7 +992,57 @@ function ensureCanvasSize() {
   }
 }
 
+function canvasPointFromEvent(e) {
+  const rect = els.canvas.getBoundingClientRect();
+  const dpr = rect.width > 0 ? els.canvas.width / rect.width : 1;
+  return {
+    x: (e.clientX - rect.left) * dpr,
+    y: (e.clientY - rect.top) * dpr,
+  };
+}
+
+function isEventInPlayfield(e) {
+  const hb = state.playfieldHitbox;
+  if (!hb) return false;
+  const p = canvasPointFromEvent(e);
+  return p.x >= hb.x && p.x <= hb.x + hb.w && p.y >= hb.y && p.y <= hb.y + hb.h;
+}
+
+function dragHasFiles(e) {
+  const types = e.dataTransfer?.types;
+  if (!types) return false;
+  return Array.from(types).includes("Files");
+}
+
+function setLoadingState(active, label = "", progress = 0) {
+  state.loadingActive = !!active;
+  state.loadingLabel = active ? String(label || "Loading...") : "";
+  state.loadingProgress = active ? clamp(Number(progress) || 0, 0, 1) : 0;
+  drawReplay();
+}
+
+function readReplayFileWithProgress(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onprogress = (e) => {
+      if (e.lengthComputable && e.total > 0) {
+        const p = e.loaded / e.total;
+        setLoadingState(true, "Loading...", p * 0.72);
+      } else {
+        setLoadingState(true, "Loading...", 0.35);
+      }
+    };
+
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error || new Error("Failed to read replay file."));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 function drawReplay() {
+  // Draw order is intentional for stable visuals:
+  // 1) stage background, 2) playfield, 3) notes, 4) cursor, 5) HUD overlays.
   ensureCanvasSize();
   const replay = state.replay;
   const w = els.canvas.width;
@@ -839,17 +1054,45 @@ function drawReplay() {
   // Keep playfield visible even before loading a replay.
   draw3DField(w, h);
 
-  if (!replay || replay.frameCount === 0) {
+  if (state.loadingActive || !replay || replay.frameCount === 0) {
     const center = project3D(0, 0, 0, w, h);
     const cx = center ? center.px : w * 0.5;
     const cy = center ? center.py : h * 0.5;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillStyle = "rgba(245, 247, 255, 0.88)";
-    ctx.font = "700 20px 'Space Grotesk'";
-    ctx.fillText("Drop replay file", cx, cy);
-    ctx.textAlign = "left";
-    ctx.textBaseline = "alphabetic";
+    if (state.loadingActive) {
+      const barW = Math.min(420, w * 0.46);
+      const barH = 12;
+      const barX = cx - barW * 0.5;
+      const barY = cy + 28;
+      const pct = clamp(state.loadingProgress, 0, 1);
+
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(245, 247, 255, 0.96)";
+      ctx.font = "700 30px 'Space Grotesk'";
+      ctx.fillText(state.loadingLabel || "Loading...", cx, cy - 6);
+
+      ctx.fillStyle = "rgba(255,255,255,0.14)";
+      roundRect(barX, barY, barW, barH, 999);
+      ctx.fill();
+
+      ctx.fillStyle = "rgba(122, 205, 255, 0.98)";
+      roundRect(barX, barY, barW * pct, barH, 999);
+      ctx.fill();
+
+      ctx.font = "600 13px 'JetBrains Mono'";
+      ctx.fillStyle = "rgba(228, 238, 255, 0.88)";
+      ctx.fillText(`${Math.round(pct * 100)}%`, cx, barY + 26);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+    } else {
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(245, 247, 255, 0.88)";
+      ctx.font = "700 30px 'Space Grotesk'";
+      ctx.fillText("Drop replay file", cx, cy);
+      ctx.textAlign = "left";
+      ctx.textBaseline = "alphabetic";
+    }
     return;
   }
 
@@ -895,6 +1138,14 @@ function drawHUDWalls(w, h) {
   const bl = project3D(-G, -G, 0, w, h);
   if (!tl || !tr || !br || !bl) return;
 
+  // Store screen-space bounding box so canvas click handler can test it.
+  state.playfieldHitbox = {
+    x: Math.min(tl.px, tr.px, br.px, bl.px),
+    y: Math.min(tl.py, tr.py, br.py, bl.py),
+    w: Math.max(tl.px, tr.px, br.px, bl.px) - Math.min(tl.px, tr.px, br.px, bl.px),
+    h: Math.max(tl.py, tr.py, br.py, bl.py) - Math.min(tl.py, tr.py, br.py, bl.py),
+  };
+
   // Canvas corners (front edges) kept for layout calls below.
   const ftl = { px: 0,  py: 0  };
   const ftr = { px: w,  py: 0  };
@@ -916,9 +1167,7 @@ function drawTopWall(ftl, ftr, tl, tr) {
   const time     = els.timeLabel?.textContent || "";
   const w = els.canvas.width;
 
-  // Header is anchored to the canvas top, not the playfield. This matches the
-  // real Rhythia HUD where title/time stack vertically with a thin divider
-  // running underneath.
+  // Header is anchored to the canvas top, not the playfield.
   const centerX = w / 2;
   ctx.textAlign = "center";
   ctx.textBaseline = "alphabetic";
@@ -997,8 +1246,7 @@ function roundRect(x, y, w, h, r) {
 }
 
 function drawSideStat(centerX, y, label, value, valueOpts = {}) {
-  // Real Rhythia: muted grey UPPERCASE label sits ABOVE the bold white
-  // value, both centered.
+  // Label above value, centered.
   ctx.textAlign = "center";
   ctx.textBaseline = "alphabetic";
   ctx.fillStyle = "rgba(180,185,195,0.75)";
@@ -1035,9 +1283,7 @@ function drawComboTriangle(centerX, centerY, comboText) {
 }
 
 function drawLeftWall(ftl, tl, bl, fbl) {
-  // Sit the column close to the playfield's left bracket (slightly inset
-  // from canvas left), matching the real Rhythia HUD where COMBO/SS/ACC
-  // hug the field instead of pinning to the screen edge.
+  // Keep left stats close to the playfield edge.
   const h = els.canvas.height;
   const colX = Math.max(110, tl.px - 130);
 
@@ -1056,7 +1302,7 @@ function drawLeftWall(ftl, tl, bl, fbl) {
   drawComboTriangle(colX, tl.py + 80, els.comboVal?.textContent || "0x");
 
   // PAUSES: just below the combo triangle.
-  drawSideStat(colX, tl.py + 180,
+  drawSideStat(colX, tl.py + 210,
     "PAUSES",
     els.pauseVal?.textContent || "0",
     { size: 22, gap: 28 });
@@ -1097,7 +1343,7 @@ function drawRightWall(ftr, tr, br, fbr) {
     els.scoreVal?.textContent || "0",
     { size: 24, gap: 28 });
 
-  drawSideStat(colX, tr.py + 180,
+  drawSideStat(colX, tr.py + 210,
     "POINTS",
     els.pointsVal?.textContent || "0",
     { size: 22, gap: 28 });
@@ -1166,7 +1412,7 @@ function buildRhythiaMapUrl(mapPageId) {
   return `https://www.rhythia.com/maps/${mapPageId}`;
 }
 
-/** Friendly short tag for a Rhythia mod identifier. */
+/** Friendly short tag for a replay mod identifier. */
 const MOD_LABELS = {
   mod_nofail: "NF",
   mod_no_fail: "NF",
@@ -1242,10 +1488,37 @@ function escapeHtml(str) {
     .replaceAll("'", "&#39;");
 }
 
+const SPEED_MIN = 0.25;
+const SPEED_MAX = 4;
+const SPEED_STEP = 0.25;
+
 function setLoadedState(loaded) {
   els.playPause.disabled = !loaded;
-  els.speed.disabled = !loaded;
+  els.speedDown.disabled = !loaded;
+  els.speedUp.disabled = !loaded;
   els.seek.disabled = !loaded;
+}
+
+function formatSpeedLabel(value) {
+  return `x${Number(value).toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1")}`;
+}
+
+function updateSpeedUI() {
+  const speed = Number(state.speed) || 1;
+  if (els.speedCurrent) els.speedCurrent.textContent = formatSpeedLabel(speed);
+  if (els.speedDown) els.speedDown.disabled = speed <= SPEED_MIN;
+  if (els.speedUp) els.speedUp.disabled = speed >= SPEED_MAX;
+}
+
+function commitSpeedEdit() {
+  const raw = parseFloat(els.speedInput.value);
+  if (!Number.isNaN(raw) && raw > 0) {
+    state.speed = clamp(Math.round(raw / SPEED_STEP) * SPEED_STEP, SPEED_MIN, SPEED_MAX);
+  }
+  els.speedInput.style.display = "none";
+  els.speedCurrent.style.display = "";
+  updateSpeedUI();
+  if (state.audio && state.audioReady) syncAudioToTimeline(true);
 }
 
 function fmtTime(ms) {
@@ -1280,7 +1553,6 @@ function detectPauseMarkersMs(replay) {
   const frames = replay?.frames || [];
   if (frames.length < 2) return [];
   const out = [];
-  const PAUSE_GAP_MS = 120;
   for (let i = 1; i < frames.length; i++) {
     const gap = frames[i].t - frames[i - 1].t;
     if (gap > PAUSE_GAP_MS) {
@@ -1423,9 +1695,7 @@ function updateStatsUI() {
   if (els.missVal)      els.missVal.textContent      = String(misses);
   if (els.accVal)       els.accVal.textContent       = (processed > 0 ? (accFrac * 100).toFixed(2) : "0.00") + "%";
   if (els.rankVal)      els.rankVal.textContent      = accuracyToRank(accFrac);
-  // X/Y where Y is the number of notes the player has reached so far
-  // (hits + misses), NOT the total in the song. Mirrors how Rhythia's HUD
-  // counts in real time.
+  // X/Y where Y is notes reached so far (hits + misses), not total song notes.
   if (els.noteCountVal) els.noteCountVal.textContent = `${hits}/${hits + misses}`;
   if (els.pointsVal)    els.pointsVal.textContent    = "\u2014"; // pp not derivable from .rhr yet
   if (els.healthFill) {
@@ -1455,30 +1725,43 @@ function replayMs() {
 }
 
 async function loadReplayFile(file) {
-  const buffer = await file.arrayBuffer();
-  const replay = parseRhr(buffer);
-  // Stop and tear down any prior audio so a new file gets a clean slate
-  teardownAudio();
-  state.replay = replay;
-  const sampleEnd = replay.lastFrameMs;
-  state.durationMs = sampleEnd + state.gracePreMs + state.gracePostMs;
-  state.currentMs = 0;
-  state.isPlaying = false;
-  state.pauseCount = 0;
-  state.lastMissCount = 0;
-  state.missFlashAt = 0;
-  if (els.pauseVal) els.pauseVal.textContent = "0";
-  els.playPause.innerHTML = "&#9654;";
-  renderMeta(replay);
-  rebuildReplayMarkers(replay);
-  setLoadedState(true);
-  updateTimeUI();
-  drawReplay();
+  setLoadingState(true, "Loading...", 0.02);
+  setLoadedState(false);
+  try {
+    const buffer = await readReplayFileWithProgress(file);
+    setLoadingState(true, "Loading...", 0.82);
+    const replay = parseRhr(buffer);
+    setLoadingState(true, "Loading...", 0.94);
 
-  // Asynchronously fetch and decode the beatmap so we can render notes.
-  loadMapNotes(replay).then(() => {
-    if (state.replay === replay) drawReplay();
-  }).catch((err) => console.warn("Map notes unavailable:", err));
+    // Stop and tear down any prior audio so a new file gets a clean slate
+    teardownAudio();
+    state.replay = replay;
+    const sampleEnd = replay.lastFrameMs;
+    state.durationMs = sampleEnd + state.gracePreMs + state.gracePostMs;
+    state.currentMs = 0;
+    state.isPlaying = false;
+    state.pauseCount = 0;
+    state.lastMissCount = 0;
+    state.missFlashAt = 0;
+    if (els.pauseVal) els.pauseVal.textContent = "0";
+    els.playPause.innerHTML = "&#9654;";
+    renderMeta(replay);
+    rebuildReplayMarkers(replay);
+    updateTimeUI();
+    setLoadingState(true, "Loading...", 0.97);
+    try {
+      await loadMapNotes(replay);
+    } catch (err) {
+      console.warn("Map notes unavailable:", err);
+    }
+
+    setLoadingState(true, "Loading...", 1);
+    setLoadedState(true);
+    setLoadingState(false);
+  } catch (err) {
+    setLoadingState(false);
+    throw err;
+  }
 }
 
 function attachDnD() {
@@ -1496,13 +1779,34 @@ function attachDnD() {
   });
 
   ["dragenter", "dragover"].forEach((evt) => {
-    els.canvas.addEventListener(evt, (e) => {
+    window.addEventListener(evt, (e) => {
+      if (!dragHasFiles(e)) return;
       e.preventDefault();
+      const nextGrid = isEventInPlayfield(e);
+      const changed = !state.dragFileOverWindow || state.dragFileOverGrid !== nextGrid;
+      state.dragFileOverWindow = true;
+      state.dragFileOverGrid = nextGrid;
+      if (changed) drawReplay();
     });
   });
 
-  els.canvas.addEventListener("drop", async (e) => {
+  window.addEventListener("dragleave", (e) => {
+    if (!state.dragFileOverWindow) return;
+    if (e.clientX > 0 && e.clientX < window.innerWidth && e.clientY > 0 && e.clientY < window.innerHeight) return;
+    state.dragFileOverWindow = false;
+    state.dragFileOverGrid = false;
+    drawReplay();
+  });
+
+  window.addEventListener("drop", async (e) => {
+    if (!dragHasFiles(e)) return;
     e.preventDefault();
+    const canDrop = isEventInPlayfield(e);
+    state.dragFileOverWindow = false;
+    state.dragFileOverGrid = false;
+    drawReplay();
+    if (!canDrop) return;
+
     const file = e.dataTransfer?.files?.[0];
     if (!file) return;
     try {
@@ -1552,10 +1856,12 @@ function attachControls() {
 
   // Canvas click:
   // - no replay loaded: open file picker
-  // - replay loaded: toggle playback (except title-link region)
+  // - replay loaded: toggle playback only when clicking inside the grid
   els.canvas.addEventListener("click", (e) => {
     if (!state.replay) {
-      els.fileInput.click();
+      if (isEventInPlayfield(e)) {
+        els.fileInput.click();
+      }
       return;
     }
     if (updateSongTitleHover(e) && state.mapUrl) {
@@ -1563,7 +1869,9 @@ function attachControls() {
       window.open(state.mapUrl, "_blank", "noopener,noreferrer");
       return;
     }
-    togglePlayback();
+    if (isEventInPlayfield(e)) {
+      togglePlayback();
+    }
   });
   els.canvas.addEventListener("pointermove", (e) => {
     updateSongTitleHover(e);
@@ -1576,20 +1884,38 @@ function attachControls() {
       drawReplay();
     }
   });
-  // Spacebar = play/pause, matching the in-game shortcut. Ignored while
-  // typing into form inputs so we don't hijack other UI.
+  // Spacebar toggles play/pause. Ignore when typing in form inputs.
   window.addEventListener("keydown", (e) => {
     if (e.code !== "Space") return;
     const tag = (e.target && e.target.tagName) || "";
-    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || tag === "BUTTON") return;
     e.preventDefault();
     togglePlayback();
   });
 
-  els.speed.addEventListener("change", () => {
-    state.speed = Number(els.speed.value);
+  const changeSpeed = (delta) => {
+    const next = Math.round((state.speed + delta) / SPEED_STEP) * SPEED_STEP;
+    state.speed = clamp(next, SPEED_MIN, SPEED_MAX);
+    updateSpeedUI();
     if (state.audio && state.audioReady) syncAudioToTimeline(true);
+  };
+  els.speedDown.addEventListener("click", () => changeSpeed(-SPEED_STEP));
+  els.speedUp.addEventListener("click", () => changeSpeed(SPEED_STEP));
+
+  els.speedCurrent.addEventListener("click", () => {
+    els.speedInput.value = state.speed;
+    els.speedInput.style.display = "";
+    els.speedCurrent.style.display = "none";
+    els.speedInput.select();
   });
+  els.speedInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); commitSpeedEdit(); }
+    if (e.key === "Escape") {
+      els.speedInput.style.display = "none";
+      els.speedCurrent.style.display = "";
+    }
+  });
+  els.speedInput.addEventListener("blur", commitSpeedEdit);
 
   els.seek.addEventListener("input", () => {
     if (!state.replay || state.replay.frameCount === 0) return;
@@ -1629,6 +1955,24 @@ function attachControls() {
     els.setCursorColor.value = normalizeHexColor(s.cursorColor, DEFAULT_VIEWER_SETTINGS.cursorColor);
     els.setNotesColor.value = normalizeHexColor(s.notesColor, DEFAULT_VIEWER_SETTINGS.notesColor);
     els.settingsPanel.classList.toggle("hidden", !state.settingsOpen);
+    if (state.settingsOpen) positionSettingsPanel();
+  };
+
+  const positionSettingsPanel = () => {
+    if (!els.settingsPanel || !els.viewerSettingsBtn) return;
+
+    const btnRect = els.viewerSettingsBtn.getBoundingClientRect();
+    const panelRect = els.settingsPanel.getBoundingClientRect();
+    const margin = 12;
+    const panelW = panelRect.width || 300;
+
+    const desiredLeft = btnRect.left + btnRect.width * 0.5 - panelW * 0.5;
+    const maxLeft = Math.max(margin, window.innerWidth - panelW - margin);
+    const clampedLeft = clamp(desiredLeft, margin, maxLeft);
+    const bottom = Math.max(margin, window.innerHeight - btnRect.top + 8);
+
+    els.settingsPanel.style.left = `${clampedLeft}px`;
+    els.settingsPanel.style.bottom = `${bottom}px`;
   };
 
   const applySettings = () => {
@@ -1640,6 +1984,10 @@ function attachControls() {
   els.viewerSettingsBtn.addEventListener("click", () => {
     state.settingsOpen = !state.settingsOpen;
     syncSettingsUI();
+  });
+
+  window.addEventListener("resize", () => {
+    if (state.settingsOpen) positionSettingsPanel();
   });
 
   els.setTabMain.addEventListener("click", () => {
@@ -1725,6 +2073,7 @@ function attachControls() {
 }
 
 setLoadedState(false);
+updateSpeedUI();
 attachDnD();
 attachControls();
 requestAnimationFrame(tick);

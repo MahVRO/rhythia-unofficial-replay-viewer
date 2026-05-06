@@ -10,6 +10,8 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <!-- Quick note: app.js hooks by id.
+       If you move markup around, keep ids stable or update the `els` map. -->
   <input id="fileInput" type="file" accept=".rhr" hidden />
 
   <div class="layout">
@@ -18,9 +20,8 @@
     </main>
   </div>
 
-  <!-- HUD data store: hidden DOM nodes whose textContent / style is read by
-       the canvas renderer each frame. Keeps stat updates as plain DOM
-       writes without needing a parallel data layer. -->
+    <!-- Hidden HUD data store.
+      Canvas reads these values every frame, so UI updates stay simple. -->
   <div id="hud-data" hidden>
     <span id="songName">Rhythia Replay Viewer</span>
     <span id="timeLabel">00:00 / 00:00</span>
@@ -37,25 +38,29 @@
     <span id="healthFill" style="width:100%;background:#4ade80"></span>
   </div>
 
-  <!-- Bottom transport dock: file + speed + interactive progress bar -->
+    <!-- Transport dock + timeline.
+      Seek slider and marker layer are paired, so keep them together. -->
   <div class="transport-dock" id="transportFloating">
-    <button class="btn-icon" id="openFile" title="Open replay">&#128194;</button>
-    <button class="btn-icon" id="viewerSettingsBtn" title="Viewer settings">&#9881;</button>
+    <button class="btn-icon" id="openFile" title="Open replay" aria-label="Open replay">
+      <img class="btn-icon-img" src="assets/icons/folder.svg" alt="" aria-hidden="true" />
+    </button>
+    <button class="btn-icon" id="viewerSettingsBtn" title="Viewer settings" aria-label="Viewer settings">
+      <img class="btn-icon-img" src="assets/icons/settings.svg" alt="" aria-hidden="true" />
+    </button>
     <button id="playPause" disabled title="Play / pause">&#9654;</button>
-    <select id="speed" class="speed-select" disabled title="Playback speed">
-      <option value="0.25">0.25x</option>
-      <option value="0.5">0.5x</option>
-      <option value="0.75">0.75x</option>
-      <option value="1" selected>1x</option>
-      <option value="1.5">1.5x</option>
-      <option value="2">2x</option>
-    </select>
+    <div class="speed-box" aria-label="Playback speed">
+      <button class="speed-arrow" id="speedDown" type="button" disabled title="Decrease speed">&#9664;</button>
+      <span id="speedCurrent" class="speed-label" title="Click to edit">x1</span>
+      <input id="speedInput" class="speed-input" type="number" min="0.25" max="4" step="0.25" style="display:none" />
+      <button class="speed-arrow" id="speedUp" type="button" disabled title="Increase speed">&#9654;</button>
+    </div>
     <div class="ipb-wrap">
       <div id="seekMarkers" class="ipb-markers" aria-hidden="true"></div>
       <input id="seek" class="ipb-slider" type="range" min="0" max="1" step="0.0001" value="0" disabled />
     </div>
   </div>
 
+  <!-- Settings panel starts hidden; app.js toggles it via .hidden. -->
   <section id="settingsPanel" class="settings-panel hidden" aria-label="Viewer settings">
     <div class="rv-settings">
       <div class="rv-tabs" role="tablist" aria-label="Settings sections">

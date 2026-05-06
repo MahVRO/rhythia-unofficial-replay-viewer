@@ -1,0 +1,37 @@
+# DEV_README
+
+If you're editing this project, thanks.
+
+The goal is simple: keep the viewer stable and keep changes easy to review.
+
+## Keep It Clean
+
+- Do not redesign stuff unless you are fixing a real visual issue.
+- Avoid huge rewrites in one shot.
+- If you remove code, explain why it is safe.
+- Keep commits focused on one thing.
+
+## Quick Test Before You Finish
+
+1. Run it locally.
+2. Load at least one real `.rhr` replay.
+3. Confirm these still work:
+   - play and pause
+   - seek bar
+   - speed changes
+   - HUD updates
+   - 3D field rendering
+4. If parsing or timing changed, test with more than one replay.
+
+## Code Notes
+
+- Prefer clear names over short clever names.
+- Replace unexplained constants with named constants when it improves clarity.
+- Add comments only where the intent would otherwise be unclear.
+- Keep browser support practical and avoid unnecessary platform-specific logic.
+
+## If Behavior Changes, Update Docs
+
+- `README.md` for user-facing changes.
+- `CHANGELOG.md` for release notes.
+- `docs/reverse-engineered.md` for reverse-engineered format and runtime notes.
