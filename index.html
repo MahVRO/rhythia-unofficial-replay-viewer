@@ -37,11 +37,10 @@
     <span id="healthFill" style="width:100%;background:#4ade80"></span>
   </div>
 
-  <!-- Floating transport (controls overlay) -->
-  <div class="transport-floating" id="transportFloating">
+  <!-- Bottom transport dock: file + speed + interactive progress bar -->
+  <div class="transport-dock" id="transportFloating">
     <button class="btn-icon" id="openFile" title="Open replay">&#128194;</button>
     <button id="playPause" disabled title="Play / pause">&#9654;</button>
-    <input id="seek" type="range" min="0" max="1" step="0.0001" value="0" disabled hidden />
     <select id="speed" class="speed-select" disabled title="Playback speed">
       <option value="0.25">0.25x</option>
       <option value="0.5">0.5x</option>
@@ -50,7 +49,7 @@
       <option value="1.5">1.5x</option>
       <option value="2">2x</option>
     </select>
-    <a class="map-link hidden" id="mapLink" target="_blank" rel="noopener noreferrer">map &#8599;</a>
+    <input id="seek" class="ipb-slider" type="range" min="0" max="1" step="0.0001" value="0" disabled />
   </div>
 
   <!-- Drop zone overlay (initial state) -->

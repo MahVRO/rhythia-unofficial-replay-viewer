@@ -36,20 +36,22 @@ canvas {
   background: var(--bg-deep);
 }
 
-/* Floating transport (bottom-left of stage) */
-.transport-floating {
+/* Bottom transport dock (merged controls + IPB) */
+.transport-dock {
   position: fixed;
-  left: 14px;
+  left: 50%;
+  transform: translateX(-50%);
   bottom: 14px;
   z-index: 6;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   background: rgba(0,0,0,0.55);
   backdrop-filter: blur(8px);
   border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 999px;
-  padding: 6px 10px;
+  border-radius: 12px;
+  padding: 8px 12px;
+  min-width: min(920px, calc(100vw - 24px));
 }
 
 #playPause { display: none !important; }
@@ -79,15 +81,17 @@ canvas {
 }
 .speed-select:disabled { opacity: 0.3; cursor: not-allowed; }
 
-.map-link {
-  font-size: 0.75rem;
-  color: var(--accent2);
-  text-decoration: none;
-  white-space: nowrap;
-  opacity: 0.85;
-  padding: 0 4px;
+.ipb-slider {
+  flex: 1;
+  min-width: 260px;
+  accent-color: #ffffff;
+  cursor: pointer;
 }
-.map-link:hover { opacity: 1; text-decoration: underline; }
+
+.ipb-slider:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
 
 /* Drop zone */
 .dropzone {

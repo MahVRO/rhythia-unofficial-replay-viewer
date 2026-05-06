@@ -24,7 +24,6 @@ const els = {
   healthFill: document.getElementById("healthFill"),
   modsRow: document.getElementById("modsRow"),
   // misc
-  mapLink: document.getElementById("mapLink"),
 };
 
 const ctx = els.canvas.getContext("2d");
@@ -45,6 +44,9 @@ const state = {
   pauseCount: 0,         // user-triggered pauses during playback
   lastMissCount: 0,      // edge detector for the miss flash effect
   missFlashAt: 0,        // performance.now() of the most recent new miss
+  mapUrl: null,          // active map URL for song-title click target
+  songTitleHover: false,
+  songTitleHitbox: null,
 };
 
 window.__rvState = state;
@@ -128,25 +130,26 @@ function parseRhr(buffer) {
   const frameCount = readU32(view, offObj.off);
   offObj.off += 4;
 
+  // Frame layout (confirmed by Rhythia dev):
+  //   Time      f32   replay-time milliseconds
+  //   PositionX f32   cursor X in world units (centered, ~±GRID_HALF)
+  //   PositionY f32   cursor Y in world units (centered, ~±GRID_HALF)
+  //   Health    f32   0..1
+  //   IsHit     u8    1 if a note was hit at this frame, else 0
+  // Frames are INTERLEAVED, 17 bytes each, no separate flag block.
   const frames = new Array(frameCount);
   for (let i = 0; i < frameCount; i++) {
-    const t = readF32(view, offObj.off);
-    const x = readF32(view, offObj.off + 4);
-    const y = readF32(view, offObj.off + 8);
-    const w = readF32(view, offObj.off + 12);
-    frames[i] = { t, x, y, w };
-    offObj.off += 16;
+    const t      = readF32(view, offObj.off);
+    const x      = readF32(view, offObj.off + 4);
+    const y      = readF32(view, offObj.off + 8);
+    const health = readF32(view, offObj.off + 12);
+    const isHit  = readU8(view, offObj.off + 16) !== 0;
+    frames[i] = { t, x, y, health, isHit };
+    offObj.off += 17;
   }
 
-  let frameFlags = new Uint8Array(0);
-  if (offObj.off + frameCount <= view.byteLength) {
-    frameFlags = new Uint8Array(buffer, offObj.off, frameCount);
-    offObj.off += frameCount;
-  }
-
-  // Last replay-time millisecond (frame index N-1 at 60Hz). Used as a
-  // fallback when SSPM length is unknown.
-  const lastFrameMs = frameCount > 0 ? (frameCount - 1) * RAW_FRAME_MS : 0;
+  // Last replay-time millisecond from the actual frame timestamps.
+  const lastFrameMs = frameCount > 0 ? frames[frameCount - 1].t : 0;
 
   return {
     magic,
@@ -163,7 +166,6 @@ function parseRhr(buffer) {
     noteCount,
     frameCount,
     frames,
-    frameFlags,
     lastFrameMs,
     unknownA,
     unknownB,
@@ -176,55 +178,6 @@ function parseRhr(buffer) {
 function isFiniteNumber(v) {
   return Number.isFinite(v) && !Number.isNaN(v);
 }
-
-function chooseDurationMs(frames, mapLengthSec) {
-  const frameDurationMs = Math.max(1000, (frames.length / 60) * 1000);
-
-  if (isFiniteNumber(mapLengthSec) && mapLengthSec > 5 && mapLengthSec < 3600) {
-    const mapMs = mapLengthSec * 1000;
-    const ratio = Math.abs(mapMs - frameDurationMs) / Math.max(1, frameDurationMs);
-    // Many replays store 100.0 here as a placeholder; avoid forcing all maps to 100s.
-    if (Math.abs(mapLengthSec - 100) > 0.01 && ratio < 0.3) {
-      return mapMs;
-    }
-  }
-
-  if (frames.length > 2) {
-    const candidates = [];
-    for (let c = 0; c < 4; c++) {
-      let prev = -Infinity;
-      let nondecreasing = 0;
-      let finiteCount = 0;
-      for (let i = 0; i < frames.length; i++) {
-        const v = c === 0 ? frames[i].t : c === 1 ? frames[i].x : c === 2 ? frames[i].y : frames[i].w;
-        if (!isFiniteNumber(v)) continue;
-        finiteCount++;
-        if (v >= prev) nondecreasing++;
-        prev = v;
-      }
-      if (finiteCount > 0) {
-        candidates.push({ c, ratio: nondecreasing / finiteCount, first: getChannel(frames[0], c), last: getChannel(frames[frames.length - 1], c) });
-      }
-    }
-
-    for (const cand of candidates) {
-      const span = cand.last - cand.first;
-      if (cand.ratio > 0.95 && isFiniteNumber(span) && span > 100 && span < 6000000) {
-        return span;
-      }
-    }
-  }
-
-  return frameDurationMs;
-}
-
-function getChannel(frame, c) {
-  if (c === 0) return frame.t;
-  if (c === 1) return frame.x;
-  if (c === 2) return frame.y;
-  return frame.w;
-}
-
 
 function safeJsonParse(value, fallback) {
   try {
@@ -243,6 +196,7 @@ const NOTE_SPAWN_Z = 18;
 
 // Note travel timing (in song-time ms, before speedScale)
 const NOTE_LOOKAHEAD_MS = 500; // distance from spawn to hit plane in song-time
+const NOTE_PRE_HIT_FADE_MS = 50; // fade out during final approach before impact
 // Hit radius in world units. SS hit box is ~1.14 units in 0..2 grid coords ≈ 0.57 cells.
 const NOTE_HIT_RADIUS_CELLS = 0.62;
 
@@ -431,15 +385,66 @@ function noteToWorld(x, y) {
   };
 }
 
-/** Cursor decoding has been retired (frame-flag deltas never produced an
- *  accurate playhead). Every note is reported as a hit until a working
- *  decoder is rebuilt. The sliced miss markers still flow through the
- *  rest of the pipeline, so the moment we have real data we just
- *  populate the array here. */
-function computeNoteHits(replay /*, speedScale */) {
+/** Sample interpolated cursor position (in SSPM grid coords, 0..2) at
+ *  replay-time `tMs`. Returns null when no frames are loaded.
+ *  Uses linear interpolation between the two surrounding frames. */
+function sampleCursor(replay, tMs) {
+  if (!replay || !replay.frames || replay.frames.length === 0) return null;
+  const frames = replay.frames;
+  // Binary search for the first frame whose t > tMs.
+  let lo = 0, hi = frames.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].t <= tMs) lo = mid + 1;
+    else hi = mid - 1;
+  }
+  const i1 = Math.min(frames.length - 1, lo);
+  const i0 = Math.max(0, i1 - 1);
+  const a = frames[i0];
+  const b = frames[i1];
+  const span = b.t - a.t;
+  const alpha = span > 0 ? Math.max(0, Math.min(1, (tMs - a.t) / span)) : 0;
+  return {
+    x: a.x + (b.x - a.x) * alpha,
+    y: a.y + (b.y - a.y) * alpha,
+    health: a.health + (b.health - a.health) * alpha,
+    isHit: b.isHit,
+  };
+}
+
+/** Classify each beatmap note as "hit" or "miss" using the per-frame IsHit
+ *  flag. The replay records exactly one IsHit=true frame per note hit at
+ *  the moment of impact, so we walk both timelines in order and pair them. */
+function computeNoteHits(replay, speedScale) {
   if (!replay || !replay.notes) return null;
-  const out = new Array(replay.notes.length);
-  for (let i = 0; i < replay.notes.length; i++) out[i] = "hit";
+  const notes = replay.notes;
+  const frames = replay.frames;
+  const out = new Array(notes.length).fill("miss");
+
+  // Collect all IsHit timestamps in replay-time ms (already chronological).
+  const hitTimes = [];
+  for (let i = 0; i < frames.length; i++) {
+    if (frames[i].isHit) hitTimes.push(frames[i].t);
+  }
+
+  // Walk both lists in order. Note timing is in song-time ms, and the
+  // replay's IsHit frames are also recorded in song-time, so the two line
+  // up directly without applying speedScale.
+  const TOLERANCE_MS = 60;
+  let hi = 0;
+  for (let ni = 0; ni < notes.length && hi < hitTimes.length; ni++) {
+    const noteT = notes[ni].ms;
+    const ht = hitTimes[hi];
+    if (ht < noteT - TOLERANCE_MS) {
+      hi++;
+      ni--;
+      continue;
+    }
+    if (Math.abs(ht - noteT) <= TOLERANCE_MS) {
+      out[ni] = "hit";
+      hi++;
+    }
+  }
   return out;
 }
 
@@ -447,18 +452,9 @@ async function loadMapNotes(replay) {
   const data = await fetchMapAssets(replay.mapPageId);
   if (!data || !data.notes || data.notes.length === 0) return;
 
-  // Map note timing (raw song ms) to replay timeline ms. Replay frames are
-  // recorded at the *played* speed, so notes need to be scaled to the replay
-  // duration so that the last note lines up with the song's end.
-  const mapMs = Math.max(
-    data.lastMs || 0,
-    data.notes[data.notes.length - 1]?.ms || 0,
-  );
-  const replayMs = state.durationMs || replay.lastFrameMs;
-  let speedScale = 1;
-  if (mapMs > 1000 && replayMs > 1000) {
-    speedScale = replayMs / mapMs;
-  }
+  // .rhr frame times and SSPM note times are both song-time milliseconds.
+  // Keep a 1:1 timeline so cursor, notes, and IsHit align exactly.
+  const speedScale = 1;
 
   replay.notes = data.notes;
   replay.notesTimeScale = speedScale;
@@ -551,6 +547,25 @@ function syncAudioToTimeline(force) {
   }
 }
 
+/** Draw the player's cursor as a small dot on the hit plane. */
+function drawCursor(canvasW, canvasH) {
+  const replay = state.replay;
+  if (!replay) return;
+  const c = sampleCursor(replay, replayMs());
+  if (!c) return;
+  // Cursor x/y are already in world units on the hit plane.
+  const p = project3D(c.x, c.y, 0, canvasW, canvasH);
+  if (!p) return;
+  const r = 6;
+  ctx.fillStyle = "#ffffff";
+  ctx.beginPath();
+  ctx.arc(p.px, p.py, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = "rgba(0,0,0,0.55)";
+  ctx.stroke();
+}
+
 /** Render notes spawning at the back and traveling toward the hit plane.
  *  - Hit notes vanish at the hit time.
  *  - Missed notes continue flying past the hit plane for NOTE_MISS_FLY_MS,
@@ -576,8 +591,7 @@ function drawNotes(canvasW, canvasH) {
   if (!refSizeProj) return;
   const refPixelHalf = Math.abs(refSizeProj.px - refProj.px);
 
-  // Collect visible notes — only future / current. Past notes (hit OR miss)
-  // simply disappear once they reach the hit plane.
+  // Visible notes are only those still approaching the hit plane.
   const notes = replay.notes;
   const visible = [];
   for (let i = 0; i < notes.length; i++) {
@@ -593,7 +607,8 @@ function drawNotes(canvasW, canvasH) {
 
   for (const v of visible) {
     const { n, dt } = v;
-    const z = (dt / lookahead) * NOTE_SPAWN_Z;
+    // Notes travel toward the hit plane and stop at z=0 on impact.
+    const z = (Math.max(0, dt) / lookahead) * NOTE_SPAWN_Z;
     const w = noteToWorld(n.x, n.y);
 
     const center = project3D(w.wx, w.wy, z, canvasW, canvasH);
@@ -603,7 +618,14 @@ function drawNotes(canvasW, canvasH) {
     const halfPx = Math.max(3, refPixelHalf * depthScale);
 
     const closeness = 1 - Math.min(1, dt / lookahead); // 0 far → 1 at hit
-    const alpha = 0.35 + closeness * 0.55;
+    let alpha = 0.45 + closeness * 0.55;
+    // Fade out in the final NOTE_PRE_HIT_FADE_MS before the hit plane.
+    const preFadeWindow = NOTE_PRE_HIT_FADE_MS * speedScale;
+    if (dt <= preFadeWindow) {
+      const k = Math.max(0, dt / Math.max(1e-6, preFadeWindow));
+      alpha *= k;
+    }
+    alpha = Math.max(0, Math.min(1, alpha));
     // All notes use the same blue regardless of verdict.
     const baseColor = "110, 195, 255";
     if (alpha <= 0) continue;
@@ -704,8 +726,9 @@ function drawReplay() {
   // Draw notes (back-to-front).
   drawNotes(w, h);
 
-  // Cursor rendering removed — see computeNoteHits comment. The HUD walls
-  // sit on top so the playfield reads as the focal element.
+  // Player cursor on the hit plane.
+  drawCursor(w, h);
+
   drawHUDWalls(w, h);
 }
 
@@ -754,9 +777,21 @@ function drawTopWall(ftl, ftr, tl, tr) {
   ctx.textBaseline = "alphabetic";
 
   // Title line
-  ctx.fillStyle = "#ffffff";
   ctx.font = "600 22px 'Space Grotesk'";
+  ctx.fillStyle = state.songTitleHover && state.mapUrl ? "#c8ced8" : "#ffffff";
   ctx.fillText(songName, centerX, 40);
+
+  // Track a clickable hitbox for the title so it behaves like the old map link.
+  const titleMeasure = ctx.measureText(songName);
+  const titleW = titleMeasure.width;
+  const ascent = titleMeasure.actualBoundingBoxAscent || 18;
+  const descent = titleMeasure.actualBoundingBoxDescent || 6;
+  state.songTitleHitbox = state.mapUrl ? {
+    x: centerX - titleW / 2,
+    y: 40 - ascent,
+    w: titleW,
+    h: ascent + descent,
+  } : null;
 
   // Time line
   ctx.fillStyle = "rgba(220,225,235,0.85)";
@@ -779,53 +814,23 @@ function drawTopWall(ftl, ftr, tl, tr) {
 }
 
 function drawBottomWall(fbl, fbr, bl, br) {
-  const w = els.canvas.width;
-  const h = els.canvas.height;
-
   // --- Health bar: pinned just under the projected playfield bottom edge,
   // spans the playfield width (with a small outset). Green/red health colors.
   const healthPct = Math.max(0, Math.min(100, parseFloat(els.healthFill?.style.width || "100") || 0));
   const healthCol = els.healthFill?.style.background || "#4ade80";
-  const HEALTH_H  = 12;
-  const healthY   = bl.py + 22;
-  const padX      = 40;
-  const xLeft     = bl.px - padX;
-  const xRight    = br.px + padX;
+  const HEALTH_H  = 9;
+  const healthY   = bl.py + 28;
+  const xLeft     = bl.px;
+  const xRight    = br.px;
   const barW      = xRight - xLeft;
   ctx.fillStyle   = "rgba(255,255,255,0.10)";
   ctx.strokeStyle = "rgba(255,255,255,0.18)";
   ctx.lineWidth   = 1;
-  roundRect(xLeft, healthY, barW, HEALTH_H, 6);
+  roundRect(xLeft, healthY, barW, HEALTH_H, 5);
   ctx.fill();
   ctx.stroke();
   ctx.fillStyle = healthCol;
-  roundRect(xLeft, healthY, barW * (healthPct / 100), HEALTH_H, 6);
-  ctx.fill();
-
-  // --- Interactive song-progress bar: bottom of the canvas. Same colors
-  // as the top progress bar (grey track, white fill) so it doesn't look
-  // like the health bar.
-  const pct = parseFloat(els.progressFill?.style.width || "0") || 0;
-  const margin = Math.max(40, w * 0.06);
-  const sxLeft  = margin;
-  const sBarW   = w - margin * 2;
-  const sBarH   = 8;
-  const sy      = h - 28;
-
-  state.seekBarRect = { x: sxLeft, y: sy, w: sBarW, h: sBarH };
-
-  ctx.fillStyle = "rgba(255,255,255,0.12)";
-  roundRect(sxLeft, sy, sBarW, sBarH, 4);
-  ctx.fill();
-  ctx.fillStyle = "#ffffff";
-  roundRect(sxLeft, sy, sBarW * (pct / 100), sBarH, 4);
-  ctx.fill();
-
-  // Handle dot for drag affordance
-  const hx = sxLeft + sBarW * (pct / 100);
-  ctx.fillStyle = "#ffffff";
-  ctx.beginPath();
-  ctx.arc(hx, sy + sBarH / 2, 6, 0, Math.PI * 2);
+  roundRect(xLeft, healthY, barW * (healthPct / 100), HEALTH_H, 5);
   ctx.fill();
 }
 
@@ -1027,6 +1032,9 @@ function renderMeta(replay) {
   const playerName = replay.mode || replay.profileType || "Unknown";
   const parsed = parseSongMeta(replay.mapId, playerName);
   const mapUrl = buildRhythiaMapUrl(replay.mapPageId);
+  state.mapUrl = mapUrl;
+  state.songTitleHover = false;
+  state.songTitleHitbox = null;
 
   // Top bar
   const songFull = parsed.artist ? `${parsed.artist} - ${parsed.title}` : parsed.title;
@@ -1054,14 +1062,6 @@ function renderMeta(replay) {
     ? tags.map((t) => `<span class="mod-tag">${escapeHtml(t)}</span>`).join("")
     : "";
 
-  // Map link
-  if (mapUrl) {
-    els.mapLink.href = mapUrl;
-    els.mapLink.textContent = `map #${replay.mapPageId} ↗`;
-    els.mapLink.classList.remove("hidden");
-  } else {
-    els.mapLink.classList.add("hidden");
-  }
 }
 
 function escapeHtml(str) {
@@ -1163,16 +1163,18 @@ function updateStatsUI() {
   const score = hits * 1000 + Math.min(combo, 64) * 5 * hits;
   const accFrac = processed > 0 ? hits / processed : 0;
 
-  // Health: starts full, each miss subtracts ~3.5%, each hit recovers ~0.7%.
-  // No-fail mod prevents bottoming out from killing playback (we just clamp >= 0).
-  let health = 100 - misses * 3.5 + hits * 0.7;
+  // Health: read straight from the replay's per-frame value. The replay
+  // stores it as 0..1, so scale to a percentage for the bar.
+  const cursor = sampleCursor(replay, tNow);
+  let health = cursor ? cursor.health * 100 : 100;
+  if (!Number.isFinite(health)) health = 100;
   if (health < 0) health = 0;
   if (health > 100) health = 100;
 
   if (els.comboVal)     els.comboVal.textContent     = combo + "x";
   if (els.scoreVal)     els.scoreVal.textContent     = String(score);
   if (els.missVal)      els.missVal.textContent      = String(misses);
-  if (els.accVal)       els.accVal.textContent       = (processed > 0 ? (accFrac * 100).toFixed(1) : "0") + "%";
+  if (els.accVal)       els.accVal.textContent       = (processed > 0 ? (accFrac * 100).toFixed(2) : "0.00") + "%";
   if (els.rankVal)      els.rankVal.textContent      = accuracyToRank(accFrac);
   // X/Y where Y is the number of notes the player has reached so far
   // (hits + misses), NOT the total in the song. Mirrors how Rhythia's HUD
@@ -1280,77 +1282,62 @@ function attachDnD() {
 
 function togglePlayback() {
   if (!state.replay) return;
-  // Pause counter only ticks when the user pauses an active playback
-  // (not when they press play to start). This mirrors how Rhythia counts
-  // user-triggered pauses during a run.
-  const willPause = state.isPlaying;
+  // Local viewer play/pause must NOT affect the replay pause counter.
+  // Keep pause count reserved for player-origin replay data only.
   state.isPlaying = !state.isPlaying;
   els.playPause.innerHTML = state.isPlaying ? "&#9646;&#9646;" : "&#9654;";
-  if (willPause) {
-    state.pauseCount += 1;
-    if (els.pauseVal) els.pauseVal.textContent = String(state.pauseCount);
-  }
   if (state.audio && state.audioReady) syncAudioToTimeline(true);
 }
 
 function attachControls() {
-  // Play button is gone — click anywhere on the canvas (above the seek
-  // bar) to toggle playback. The toolbar still has a hidden #playPause
+  // Play button is gone — click anywhere on the canvas to toggle playback.
+  // The toolbar still has a hidden #playPause
   // node; we just don't bind a click listener to it.
 
-  // Canvas click → toggle playback (but only when not interacting with the
-  // seek bar, which has its own pointer handlers below).
-  els.canvas.addEventListener("click", (e) => {
-  if (!state.replay) return;
+  const updateSongTitleHover = (e) => {
+    const hb = state.songTitleHitbox;
+    if (!hb || !state.mapUrl) {
+      if (state.songTitleHover) {
+        state.songTitleHover = false;
+        els.canvas.style.cursor = "";
+        drawReplay();
+      }
+      return false;
+    }
     const rect = els.canvas.getBoundingClientRect();
     const dpr = els.canvas.width / rect.width;
     const cx = (e.clientX - rect.left) * dpr;
     const cy = (e.clientY - rect.top) * dpr;
-    const sb = state.seekBarRect;
-    if (sb && cx >= sb.x && cx <= sb.x + sb.w && cy >= sb.y - 12 && cy <= sb.y + sb.h + 12) {
-      return; // seek bar handles this
+    const hovered = cx >= hb.x && cx <= hb.x + hb.w && cy >= hb.y && cy <= hb.y + hb.h;
+    if (hovered !== state.songTitleHover) {
+      state.songTitleHover = hovered;
+      els.canvas.style.cursor = hovered ? "pointer" : "";
+      drawReplay();
+    }
+    return hovered;
+  };
+
+  // Canvas click → toggle playback, except title-link region.
+  els.canvas.addEventListener("click", (e) => {
+    if (!state.replay) return;
+    if (updateSongTitleHover(e) && state.mapUrl) {
+      if (state.isPlaying) togglePlayback();
+      window.open(state.mapUrl, "_blank", "noopener,noreferrer");
+      return;
     }
     togglePlayback();
   });
-
-  // Seek bar drag handling (pointer-based for canvas)
-  let dragging = false;
-  const seekFromEvent = (e) => {
-    const rect = els.canvas.getBoundingClientRect();
-    const dpr = els.canvas.width / rect.width;
-    const cx = (e.clientX - rect.left) * dpr;
-    const sb = state.seekBarRect;
-    if (!sb) return;
-    const t = Math.max(0, Math.min(1, (cx - sb.x) / sb.w));
-    state.currentMs = t * state.durationMs;
-    if (state.audio && state.audioReady) syncAudioToTimeline(true);
-    updateTimeUI();
-    drawReplay();
-  };
-  els.canvas.addEventListener("pointerdown", (e) => {
-    if (!state.replay) return;
-    const rect = els.canvas.getBoundingClientRect();
-    const dpr = els.canvas.width / rect.width;
-    const cx = (e.clientX - rect.left) * dpr;
-    const cy = (e.clientY - rect.top) * dpr;
-    const sb = state.seekBarRect;
-    if (!sb) return;
-    if (cx >= sb.x && cx <= sb.x + sb.w && cy >= sb.y - 12 && cy <= sb.y + sb.h + 12) {
-      dragging = true;
-      els.canvas.setPointerCapture(e.pointerId);
-      seekFromEvent(e);
-    }
-  });
   els.canvas.addEventListener("pointermove", (e) => {
-    if (dragging) seekFromEvent(e);
-  });
-  els.canvas.addEventListener("pointerup", (e) => {
-    if (dragging) {
-      dragging = false;
-      try { els.canvas.releasePointerCapture(e.pointerId); } catch {}
-    }
+    updateSongTitleHover(e);
   });
 
+  els.canvas.addEventListener("pointerleave", () => {
+    if (state.songTitleHover) {
+      state.songTitleHover = false;
+      els.canvas.style.cursor = "";
+      drawReplay();
+    }
+  });
   // Spacebar = play/pause, matching the in-game shortcut. Ignored while
   // typing into form inputs so we don't hijack other UI.
   window.addEventListener("keydown", (e) => {
