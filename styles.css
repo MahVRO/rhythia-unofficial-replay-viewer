@@ -287,35 +287,6 @@ canvas {
   border-radius: 4px;
 }
 
-.rv-skin-btn {
-  border: 1px solid rgba(255,255,255,0.24);
-  background: rgba(255,255,255,0.08);
-  color: rgba(245,246,250,0.95);
-  font-family: inherit;
-  font-size: 0.74rem;
-  border-radius: 6px;
-  padding: 3px 8px;
-  cursor: pointer;
-}
-
-.rv-skin-btn:hover {
-  background: rgba(255,255,255,0.14);
-}
-
-.rv-row-meta {
-  align-items: baseline;
-}
-
-.rv-meta-text {
-  font-size: 0.75rem;
-  color: rgba(220,225,235,0.78);
-  max-width: 155px;
-  text-overflow: ellipsis;
-  overflow: hidden;
-  white-space: nowrap;
-  text-align: right;
-}
-
 @media (max-width: 900px) {
   .settings-panel {
     bottom: 74px;

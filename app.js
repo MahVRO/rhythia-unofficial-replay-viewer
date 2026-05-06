@@ -72,27 +72,10 @@ const state = {
   viewerSettings: null,
   settingsOpen: false,
   settingsTab: "main",
-  skin: {
-    name: "",
-    cursorImage: null,
-    cursorScale: 1,
-    cursorOpacity: 1,
-    cursorObjectUrl: null,
-    backgroundColor: { r: 5, g: 10, b: 15 },
-    backgroundImage: null,
-    backgroundOpacity: 0,
-    backgroundObjectUrl: null,
-    backgroundImages: [], // array of all background images with metadata
-    grid: {
-      enabled: false,
-      color: { r: 255, g: 255, b: 255 },
-      opacity: 0.22,
-      thickness: 2,
-    },
-  },
 };
 
 const VIEWER_SETTINGS_KEY = "rvViewerSettingsV2";
+const DEFAULT_STAGE_BG = "rgb(5, 10, 15)";
 const DEFAULT_VIEWER_SETTINGS = {
   highlightMisses: true,
   showFps: false,
@@ -123,235 +106,6 @@ function hexToRgb(value) {
     g: Number.parseInt(hex.slice(2, 4), 16),
     b: Number.parseInt(hex.slice(4, 6), 16),
   };
-}
-
-function readU16From(bytes, off) {
-  return bytes[off] | (bytes[off + 1] << 8);
-}
-
-function readU32From(bytes, off) {
-  return ((bytes[off]) | (bytes[off + 1] << 8) | (bytes[off + 2] << 16) | (bytes[off + 3] << 24)) >>> 0;
-}
-
-function basenamePath(path) {
-  return String(path || "").split(/[\\/]/).pop() || "";
-}
-
-function guessMimeType(path) {
-  const lower = String(path || "").toLowerCase();
-  if (lower.endsWith(".png")) return "image/png";
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
-  if (lower.endsWith(".webp")) return "image/webp";
-  return "application/octet-stream";
-}
-
-async function inflateDeflateRaw(bytes) {
-  if (typeof DecompressionStream !== "function") {
-    throw new Error("This browser does not support DecompressionStream for .rhs files.");
-  }
-  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
-  const out = await new Response(stream).arrayBuffer();
-  return new Uint8Array(out);
-}
-
-function findZipEocdOffset(bytes) {
-  const min = Math.max(0, bytes.length - 66000);
-  for (let i = bytes.length - 22; i >= min; i--) {
-    if (readU32From(bytes, i) === 0x06054b50) return i;
-  }
-  return -1;
-}
-
-async function unzipEntries(arrayBuffer) {
-  const bytes = new Uint8Array(arrayBuffer);
-  const eocd = findZipEocdOffset(bytes);
-  if (eocd < 0) throw new Error("Invalid .rhs archive: missing end-of-central-directory record.");
-
-  const totalEntries = readU16From(bytes, eocd + 10);
-  const centralOffset = readU32From(bytes, eocd + 16);
-  const out = new Map();
-  const textDecoder = new TextDecoder();
-  let p = centralOffset;
-
-  for (let i = 0; i < totalEntries; i++) {
-    if (readU32From(bytes, p) !== 0x02014b50) {
-      throw new Error("Invalid .rhs archive: malformed central directory.");
-    }
-    const compressionMethod = readU16From(bytes, p + 10);
-    const compressedSize = readU32From(bytes, p + 20);
-    const fileNameLen = readU16From(bytes, p + 28);
-    const extraLen = readU16From(bytes, p + 30);
-    const commentLen = readU16From(bytes, p + 32);
-    const localHeaderOffset = readU32From(bytes, p + 42);
-
-    const nameBytes = bytes.slice(p + 46, p + 46 + fileNameLen);
-    const name = textDecoder.decode(nameBytes);
-
-    if (readU32From(bytes, localHeaderOffset) !== 0x04034b50) {
-      throw new Error("Invalid .rhs archive: malformed local file header.");
-    }
-    const localNameLen = readU16From(bytes, localHeaderOffset + 26);
-    const localExtraLen = readU16From(bytes, localHeaderOffset + 28);
-    const dataStart = localHeaderOffset + 30 + localNameLen + localExtraLen;
-    const compressed = bytes.slice(dataStart, dataStart + compressedSize);
-
-    let payload;
-    if (compressionMethod === 0) payload = compressed;
-    else if (compressionMethod === 8) payload = await inflateDeflateRaw(compressed);
-    else throw new Error(`Unsupported .rhs compression method: ${compressionMethod}`);
-
-    out.set(name, payload);
-    p += 46 + fileNameLen + extraLen + commentLen;
-  }
-
-  return out;
-}
-
-function findArchiveEntryByBasename(entries, wantedBase) {
-  const wanted = String(wantedBase || "").toLowerCase();
-  if (!wanted) return "";
-  for (const key of entries.keys()) {
-    if (basenamePath(key).toLowerCase() === wanted) return key;
-  }
-  return "";
-}
-
-async function bytesToImage(bytes, path) {
-  const objectUrl = URL.createObjectURL(new Blob([bytes], { type: guessMimeType(path) }));
-  const img = new Image();
-  await new Promise((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error(`Failed to decode image: ${path}`));
-    img.src = objectUrl;
-  });
-  return { img, objectUrl };
-}
-
-function clearSkinAssets() {
-  if (state.skin.cursorObjectUrl) URL.revokeObjectURL(state.skin.cursorObjectUrl);
-  if (state.skin.backgroundObjectUrl) URL.revokeObjectURL(state.skin.backgroundObjectUrl);
-  state.skin.backgroundImages?.forEach(bg => {
-    if (bg.objectUrl) URL.revokeObjectURL(bg.objectUrl);
-  });
-  state.skin.cursorObjectUrl = null;
-  state.skin.backgroundObjectUrl = null;
-  state.skin.cursorImage = null;
-  state.skin.cursorScale = 1;
-  state.skin.cursorOpacity = 1;
-  state.skin.backgroundColor = { r: 5, g: 10, b: 15 };
-  state.skin.backgroundImage = null;
-  state.skin.backgroundOpacity = 0;
-  state.skin.backgroundImages = [];
-  state.skin.grid = {
-    enabled: false,
-    color: { r: 255, g: 255, b: 255 },
-    opacity: 0.22,
-    thickness: 2,
-  };
-}
-
-async function loadSkinFile(file) {
-  // Prevent multiple simultaneous loads
-  if (window._loadingSkinFile) return;
-  window._loadingSkinFile = true;
-  
-  try {
-    const archive = await unzipEntries(await file.arrayBuffer());
-  const configEntry = archive.get("config") || archive.get("config.json");
-  if (!configEntry) throw new Error("Skin is missing required config file.");
-  const configText = new TextDecoder().decode(configEntry);
-  const config = JSON.parse(configText);
-  
-  // Normalize European decimal separators (commas to periods)
-  const normalizeNumber = (val) => {
-    if (typeof val === 'string') {
-      return Number(val.replace(',', '.'));
-    }
-    return Number(val);
-  };
-
-  clearSkinAssets();
-  state.skin.name = file.name || "Unnamed skin";
-  state.skin.cursorScale = clamp(normalizeNumber(config?.CursorScale?.Value) || 1, 0.2, 4);
-  state.skin.cursorOpacity = clamp(normalizeNumber(config?.CursorOpacity?.Value) || 1, 0.05, 1);
-  state.skin.backgroundColor = {
-    r: clamp(Math.round(normalizeNumber(config?.BackgroundRed?.Value) || 0), 0, 255),
-    g: clamp(Math.round(normalizeNumber(config?.BackgroundGreen?.Value) || 0), 0, 255),
-    b: clamp(Math.round(normalizeNumber(config?.BackgroundBlue?.Value) || 0), 0, 255),
-  };
-  state.skin.grid = {
-    enabled: !!config?.PlayfieldGridEnabled?.Value,
-    color: {
-      r: clamp(Math.round(normalizeNumber(config?.PlayfieldGridColorRed?.Value) || 255), 0, 255),
-      g: clamp(Math.round(normalizeNumber(config?.PlayfieldGridColorGreen?.Value) || 255), 0, 255),
-      b: clamp(Math.round(normalizeNumber(config?.PlayfieldGridColorBlue?.Value) || 255), 0, 255),
-    },
-    opacity: clamp(normalizeNumber(config?.PlayfieldGridOpacity?.Value) || 0, 0, 1),
-    thickness: clamp(normalizeNumber(config?.PlayfieldGridThickness?.Value) || 2, 0.5, 12),
-  };
-
-  const cursorBase = basenamePath(config?.CursorSkin?.Value);
-  let cursorEntry = findArchiveEntryByBasename(archive, cursorBase);
-  if (!cursorEntry) {
-    cursorEntry = [...archive.keys()].find((k) => /^cursorskin\//i.test(k) && /\.(png|jpg|jpeg|webp)$/i.test(k));
-  }
-  if (cursorEntry) {
-    const cursorAsset = await bytesToImage(archive.get(cursorEntry), cursorEntry);
-    state.skin.cursorImage = cursorAsset.img;
-    state.skin.cursorObjectUrl = cursorAsset.objectUrl;
-  }
-
-  // Load all background images with their metadata
-  // Try both direct array and wrapped in Value property
-  let bgImages = config?.BackgroundImages?.Value || config?.BackgroundImages || [];
-  if (!Array.isArray(bgImages)) bgImages = [];
-  state.skin.backgroundImages = [];
-  
-  for (let i = 0; i < bgImages.length; i++) {
-    const bgConfig = bgImages[i];
-    const bgWanted = basenamePath(bgConfig?.Path);
-    let bgEntry = bgWanted ? findArchiveEntryByBasename(archive, bgWanted) : "";
-    
-    if (!bgEntry) {
-      // Fallback: find by index folder
-      const indexedPath = `backgrounds/${i}/`;
-      bgEntry = [...archive.keys()].find((k) => k.startsWith(indexedPath) && /\.(png|jpg|jpeg|webp)$/i.test(k));
-    }
-    
-    if (bgEntry) {
-      try {
-        const bgAsset = await bytesToImage(archive.get(bgEntry), bgEntry);
-        const bgOpacity = normalizeNumber(bgConfig?.TintOpacity);
-        const imageObj = {
-          img: bgAsset.img,
-          objectUrl: bgAsset.objectUrl,
-          opacity: Number.isFinite(bgOpacity) ? clamp(bgOpacity, 0, 1) : 0.12,
-          placement: bgConfig?.Placement || 0, // 0 = background, 1 = overlay
-          centerX: normalizeNumber(bgConfig?.CenterX) || 0.5,
-          centerY: normalizeNumber(bgConfig?.CenterY) || 0.5,
-          scaleX: normalizeNumber(bgConfig?.ScaleX) || 1,
-          scaleY: normalizeNumber(bgConfig?.ScaleY) || 1,
-          rotation: normalizeNumber(bgConfig?.Rotation) || 0,
-          fit: bgConfig?.Fit || 0,
-          flipHorizontal: bgConfig?.FlipHorizontal || false,
-          // Rhythia skin "space" coordinates are in an 8x8 virtual plane.
-          spaceX: normalizeNumber(bgConfig?.SpaceX),
-          spaceY: normalizeNumber(bgConfig?.SpaceY),
-          spaceWidth: normalizeNumber(bgConfig?.SpaceWidth),
-          spaceHeight: normalizeNumber(bgConfig?.SpaceHeight),
-        };
-        state.skin.backgroundImages.push(imageObj);
-      } catch (e) {
-        // Error loading image, skip it
-      }
-    }
-  }
-
-  if (els.setSkinStatus) els.setSkinStatus.textContent = state.skin.name;
-  drawReplay();
-  } finally {
-    window._loadingSkinFile = false;
-  }
 }
 
 function loadViewerSettings() {
@@ -472,8 +226,8 @@ function parseRhr(buffer) {
 
   // Frame layout (confirmed by Rhythia dev):
   //   Time      f32   replay-time milliseconds
-  //   PositionX f32   cursor X in world units (centered, ~-�GRID_HALF)
-  //   PositionY f32   cursor Y in world units (centered, ~-�GRID_HALF)
+  //   PositionX f32   cursor X in world units (centered, about +/- GRID_HALF)
+  //   PositionY f32   cursor Y in world units (centered, about +/- GRID_HALF)
   //   Health    f32   0..1
   //   IsHit     u8    1 if a note was hit at this frame, else 0
   // Frames are INTERLEAVED, 17 bytes each, no separate flag block.
@@ -527,19 +281,17 @@ function safeJsonParse(value, fallback) {
   }
 }
 
-// ��������� 3D Rendering System ���������������������������������������������������������������������������������������������������������������������������������������������������
+// 3D rendering system.
 
-// World dimensions: the hit plane is a flat square -�GRID_HALF in x and y, at z = 0.
+// World dimensions: the hit plane is a flat square +/- GRID_HALF in x and y, at z = 0.
 // Notes (when added) will spawn at NOTE_SPAWN_Z and travel toward z = 0.
 const GRID_HALF = 1.4;
 const NOTE_SPAWN_Z = 18;
 
 // Note travel timing (in song-time ms, before speedScale)
-const NOTE_LOOKAHEAD_MS = 500; // distance from spawn to hit plane in song-time
 const NOTE_PRE_HIT_FADE_MS = 50; // fade out during final approach before impact
 const NOTE_MISS_PAST_MS = 20; // missed notes continue past the grid for a brief time
-// Hit radius in world units. SS hit box is ~1.14 units in 0..2 grid coords ��� 0.57 cells.
-const NOTE_HIT_RADIUS_CELLS = 0.62;
+// Hit radius is approximated from projected cell size in drawNotes().
 
 // Fixed perspective camera. Straight-on Rhythia POV: dead center, level
 // (no pitch). Pulled back ~20% from the original distance for a wider
@@ -605,7 +357,7 @@ function project3D(wx, wy, wz, canvasW, canvasH) {
   const ndcX     = (camRight / camDepth) * focalLen;
   const ndcY     = (camUp    / camDepth) * focalLen;
 
-  // NDC [-1,1] ��� pixel space; NDC Y is flipped (canvas Y increases downward)
+  // NDC [-1,1] to pixel space; NDC Y is flipped because canvas Y grows downward.
   const px = ((ndcX / aspect) + 1) * 0.5 * canvasW;
   const py = (1 - ndcY) * 0.5 * canvasH;
 
@@ -623,7 +375,7 @@ function drawLine3D(ax, ay, az, bx, by, bz, canvasW, canvasH) {
   ctx.stroke();
 }
 
-// ��������� Notes (SSPM v2) ������������������������������������������������������������������������������������������������������������������������������������������������������������
+// Notes (SSPM v2).
 
 /**
  * Parse a Sound Space Plus Map v2 file.
@@ -663,7 +415,7 @@ function parseSspm(buffer) {
     off += 4;
     const type = u[off++];
     if (type !== 0) {
-      // Unknown marker type ��� we can't reliably skip without a generic value reader.
+      // Unknown marker type; we cannot reliably skip without a generic value reader.
       // Bail out; we already have the notes that came before.
       break;
     }
@@ -716,12 +468,12 @@ async function fetchMapAssets(mapPageId) {
 
 /** Convert SSPM grid coordinates (x,y in [0,2]) to world coords on the hit plane.
  *  In Sound Space, x=0,1,2 are *cell centers*, not the outer edges of the playfield.
- *  So a 3-cell grid with half-extent GRID_HALF puts cells at -�(2/3)*GRID_HALF and 0. */
+ *  So a 3-cell grid with half-extent GRID_HALF puts cells at +/- (2/3) * GRID_HALF and 0. */
 function noteToWorld(x, y) {
   const CELL = (2 * GRID_HALF) / 3;
   return {
-    wx: (x - 1) * CELL,         // x=0 ��� -CELL, x=1 ��� 0, x=2 ��� +CELL
-    wy: (1 - y) * CELL,         // y=0 (top in SS) ��� +CELL, y=2 (bottom) ��� -CELL
+    wx: (x - 1) * CELL,         // x=0 -> -CELL, x=1 -> 0, x=2 -> +CELL
+    wy: (1 - y) * CELL,         // y=0 (top in SS) -> +CELL, y=2 (bottom) -> -CELL
     wz: 0,
   };
 }
@@ -898,15 +650,6 @@ function drawCursor(canvasW, canvasH) {
   // Cursor x/y are already in world units on the hit plane.
   const p = project3D(c.x, c.y, 0, canvasW, canvasH);
   if (!p) return;
-  if (state.skin.cursorImage) {
-    const img = state.skin.cursorImage;
-    const side = Math.max(8, 24 * state.skin.cursorScale);
-    ctx.save();
-    ctx.globalAlpha = clamp(state.skin.cursorOpacity, 0.05, 1);
-    ctx.drawImage(img, p.px - side * 0.5, p.py - side * 0.5, side, side);
-    ctx.restore();
-    return;
-  }
 
   const r = 6;
   ctx.fillStyle = state.viewerSettings.cursorColor || "#ffffff";
@@ -976,7 +719,7 @@ function drawNotes(canvasW, canvasH) {
     const depthScale = Math.max(0.06, refProj.depth / Math.max(1e-6, center.depth));
     const halfPx = Math.max(3, refPixelHalf * depthScale);
 
-    const closeness = 1 - Math.min(1, dt / lookahead); // 0 far ��� 1 at hit
+    const closeness = 1 - Math.min(1, dt / lookahead); // 0 far, 1 at hit
     let alpha = 0.45 + closeness * 0.55;
     const isMiss = v.verdict === "miss";
     const preFadeWindow = NOTE_PRE_HIT_FADE_MS * speedScale;
@@ -1001,7 +744,7 @@ function drawNotes(canvasW, canvasH) {
     const radius = halfPx * 0.32;
     const stroke = Math.max(1.5, halfPx * 0.16);
 
-    // Single hollow rounded square ��� no inner outline.
+    // Single hollow rounded square with no inner outline.
     ctx.lineWidth = stroke;
     ctx.strokeStyle = `rgba(${baseColor}, ${alpha.toFixed(3)})`;
     roundRect(cx - halfPx, cy - halfPx, halfPx * 2, halfPx * 2, radius);
@@ -1024,28 +767,13 @@ function drawNotes(canvasW, canvasH) {
 function draw3DField(canvasW, canvasH) {
   const G = GRID_HALF;
   // Match the real Rhythia HUD: no playfield fill (the bg is just black),
-  // no outer border ��� only four L-shaped corner brackets framing the
+  // no outer border, only four L-shaped corner brackets framing the
   // projected hit plane.
   const tl = project3D(-G,  G, 0, canvasW, canvasH);
   const tr = project3D( G,  G, 0, canvasW, canvasH);
   const br = project3D( G, -G, 0, canvasW, canvasH);
   const bl = project3D(-G, -G, 0, canvasW, canvasH);
   if (!tl || !tr || !br || !bl) return;
-
-  if (state.skin.grid.enabled && state.skin.grid.opacity > 0) {
-    const gridColor = state.skin.grid.color;
-    ctx.save();
-    ctx.strokeStyle = `rgba(${gridColor.r}, ${gridColor.g}, ${gridColor.b}, ${state.skin.grid.opacity.toFixed(3)})`;
-    ctx.lineWidth = state.skin.grid.thickness;
-    ctx.lineCap = "round";
-
-    const CELL = (2 * G) / 3;
-    drawLine3D(-G + CELL, G, 0, -G + CELL, -G, 0, canvasW, canvasH);
-    drawLine3D(-G + CELL * 2, G, 0, -G + CELL * 2, -G, 0, canvasW, canvasH);
-    drawLine3D(-G, G - CELL, 0, G, G - CELL, 0, canvasW, canvasH);
-    drawLine3D(-G, G - CELL * 2, 0, G, G - CELL * 2, 0, canvasW, canvasH);
-    ctx.restore();
-  }
 
   const armX = Math.max(20, Math.min(46, (tr.px - tl.px) * 0.055));
   const armY = Math.max(20, Math.min(46, (bl.py - tl.py) * 0.055));
@@ -1104,117 +832,9 @@ function drawReplay() {
   const replay = state.replay;
   const w = els.canvas.width;
   const h = els.canvas.height;
-  const SPACE_FIT2_SIZE_GAIN = 1.9;
-  const SPACE_POS_X_GAIN = 0.78;
-  const SPACE_POS_Y_GAIN = 0.92;
   ctx.clearRect(0, 0, w, h);
-  const bg = state.skin.backgroundColor;
-  ctx.fillStyle = `rgb(${bg.r}, ${bg.g}, ${bg.b})`;
+  ctx.fillStyle = DEFAULT_STAGE_BG;
   ctx.fillRect(0, 0, w, h);
-
-  const playTl = project3D(-GRID_HALF, GRID_HALF, 0, w, h);
-  const playTr = project3D(GRID_HALF, GRID_HALF, 0, w, h);
-  const playBr = project3D(GRID_HALF, -GRID_HALF, 0, w, h);
-  const playBl = project3D(-GRID_HALF, -GRID_HALF, 0, w, h);
-  const playfieldRect = (playTl && playTr && playBr && playBl)
-    ? {
-        minX: Math.min(playTl.px, playTr.px, playBr.px, playBl.px),
-        maxX: Math.max(playTl.px, playTr.px, playBr.px, playBl.px),
-        minY: Math.min(playTl.py, playTr.py, playBr.py, playBl.py),
-        maxY: Math.max(playTl.py, playTr.py, playBr.py, playBl.py),
-      }
-    : null;
-
-  // Draw background images (Placement: 0) FIRST - these go behind everything
-  state.skin.backgroundImages?.forEach(bg => {
-    if (bg.placement === 0 && bg.img) {
-      const img = bg.img;
-      ctx.save();
-      ctx.globalAlpha = clamp(bg.opacity, 0, 1);
-
-      const hasSpaceRect =
-        Number.isFinite(bg.spaceX) &&
-        Number.isFinite(bg.spaceY) &&
-        Number.isFinite(bg.spaceWidth) &&
-        Number.isFinite(bg.spaceHeight) &&
-        bg.spaceWidth > 0 &&
-        bg.spaceHeight > 0;
-
-      let spacePxW = 0;
-      let spacePxH = 0;
-      let centerX = bg.centerX * w;
-      let centerY = bg.centerY * h;
-
-      if (hasSpaceRect) {
-        // Rhythia's virtual skin plane is 8x8 units with origin at center.
-        // Position uses full-canvas space mapping.
-        const posScaleX = w / 8;
-        const posScaleY = h / 8;
-        const spaceCenterX = (w * 0.5) + (bg.spaceX * SPACE_POS_X_GAIN * posScaleX);
-        const spaceCenterY = (h * 0.5) - (bg.spaceY * SPACE_POS_Y_GAIN * posScaleY);
-
-        // Size uses projected playfield scale so overlays don't overrun side HUD panels.
-        const sizeScaleX = ((playfieldRect?.maxX ?? w) - (playfieldRect?.minX ?? 0)) / 8;
-        const sizeScaleY = ((playfieldRect?.maxY ?? h) - (playfieldRect?.minY ?? 0)) / 8;
-        spacePxW = bg.spaceWidth * sizeScaleX * SPACE_FIT2_SIZE_GAIN;
-        spacePxH = bg.spaceHeight * sizeScaleY * SPACE_FIT2_SIZE_GAIN;
-
-        centerX = spaceCenterX;
-        centerY = spaceCenterY;
-      }
-      
-      // Calculate image dimensions based on fit mode
-      let dw = img.width;
-      let dh = img.height;
-      
-      if (bg.fit === 0) {
-        // Cover: scale to cover canvas
-        const coverScale = Math.max(w / Math.max(1, img.width), h / Math.max(1, img.height));
-        dw = img.width * coverScale;
-        dh = img.height * coverScale;
-      } else if (bg.fit === 1) {
-        // Contain: scale to fit inside canvas
-        const containScale = Math.min(w / Math.max(1, img.width), h / Math.max(1, img.height));
-        dw = img.width * containScale;
-        dh = img.height * containScale;
-      } else if (bg.fit === 2 && hasSpaceRect && bg.placement === 1) {
-        // Native-in-space: treat scale as percentage of viewport-space rect.
-        dw = spacePxW;
-        dh = spacePxH;
-      }
-      // else: fit 2 or other = use native size
-      
-      // For fit=2 skins with explicit space rect, space size is already final.
-      if (!(bg.fit === 2 && hasSpaceRect)) {
-        dw *= bg.scaleX;
-        dh *= bg.scaleY;
-      }
-      
-      // Apply transformations (translate -> rotate -> flip -> draw)
-      ctx.translate(centerX, centerY);
-      ctx.rotate((bg.rotation * Math.PI) / 180);
-      if (bg.flipHorizontal) {
-        ctx.scale(-1, 1);
-      }
-      
-      ctx.drawImage(img, -dw * 0.5, -dh * 0.5, dw, dh);
-      ctx.restore();
-    }
-  });
-
-  // Legacy background image support - disabled in favor of new backgroundImages array
-  // if (state.skin.backgroundImage) {
-  //   const img = state.skin.backgroundImage;
-  //   const coverScale = Math.max(w / Math.max(1, img.width), h / Math.max(1, img.height));
-  //   const dw = img.width * coverScale;
-  //   const dh = img.height * coverScale;
-  //   const dx = (w - dw) * 0.5;
-  //   const dy = (h - dh) * 0.5;
-  //   ctx.save();
-  //   ctx.globalAlpha = clamp(state.skin.backgroundOpacity, 0, 1);
-  //   ctx.drawImage(img, dx, dy, dw, dh);
-  //   ctx.restore();
-  // }
 
   // Keep playfield visible even before loading a replay.
   draw3DField(w, h);
@@ -1257,86 +877,6 @@ function drawReplay() {
     ctx.textAlign = "left";
     ctx.textBaseline = "alphabetic";
   }
-
-  // Draw overlay background images (Placement: 1) on top of everything
-  state.skin.backgroundImages?.forEach(bg => {
-    if (bg.placement === 1 && bg.img) {
-      const img = bg.img;
-      ctx.save();
-      ctx.globalAlpha = clamp(bg.opacity, 0, 1);
-
-      const hasSpaceRect =
-        Number.isFinite(bg.spaceX) &&
-        Number.isFinite(bg.spaceY) &&
-        Number.isFinite(bg.spaceWidth) &&
-        Number.isFinite(bg.spaceHeight) &&
-        bg.spaceWidth > 0 &&
-        bg.spaceHeight > 0;
-
-      let spacePxW = 0;
-      let spacePxH = 0;
-      let centerX = bg.centerX * w;
-      let centerY = bg.centerY * h;
-
-      if (hasSpaceRect) {
-        const posScaleX = w / 8;
-        const posScaleY = h / 8;
-        const spaceCenterX = (w * 0.5) + (bg.spaceX * SPACE_POS_X_GAIN * posScaleX);
-        const spaceCenterY = (h * 0.5) - (bg.spaceY * SPACE_POS_Y_GAIN * posScaleY);
-
-        const sizeScaleX = ((playfieldRect?.maxX ?? w) - (playfieldRect?.minX ?? 0)) / 8;
-        const sizeScaleY = ((playfieldRect?.maxY ?? h) - (playfieldRect?.minY ?? 0)) / 8;
-        spacePxW = bg.spaceWidth * sizeScaleX * SPACE_FIT2_SIZE_GAIN;
-        spacePxH = bg.spaceHeight * sizeScaleY * SPACE_FIT2_SIZE_GAIN;
-
-        centerX = spaceCenterX;
-        centerY = spaceCenterY;
-      }
-      
-      // Calculate image dimensions based on fit mode
-      let dw = img.width;
-      let dh = img.height;
-      
-      if (bg.fit === 0) {
-        // Cover: scale to cover canvas
-        const coverScale = Math.max(w / Math.max(1, img.width), h / Math.max(1, img.height));
-        dw = img.width * coverScale;
-        dh = img.height * coverScale;
-      } else if (bg.fit === 1) {
-        // Contain: scale to fit inside canvas
-        const containScale = Math.min(w / Math.max(1, img.width), h / Math.max(1, img.height));
-        dw = img.width * containScale;
-        dh = img.height * containScale;
-      } else if (bg.fit === 2) {
-        if (hasSpaceRect) {
-          // Native-in-space: match Rhythia's skin space rectangle behavior.
-          dw = spacePxW;
-          dh = spacePxH;
-        } else {
-          // Fallback for skins without space data: use viewport-relative dimensions.
-          dw = w;
-          dh = h;
-        }
-      }
-      // else: fit 2 or other = use native size
-      
-      // For fit=2 skins with explicit space rect, space size is already final.
-      if (!(bg.fit === 2 && hasSpaceRect)) {
-        dw *= bg.scaleX;
-        dh *= bg.scaleY;
-      }
-      
-      // Apply transformations (translate -> rotate -> flip -> draw)
-      ctx.translate(centerX, centerY);
-      ctx.rotate((bg.rotation * Math.PI) / 180);
-      if (bg.flipHorizontal) {
-        ctx.scale(-1, 1);
-      }
-      
-      ctx.drawImage(img, -dw * 0.5, -dh * 0.5, dw, dh);
-      ctx.restore();
-    }
-  });
 }
 
 // ----------------------------------------------------------------------
@@ -1355,13 +895,13 @@ function drawHUDWalls(w, h) {
   const bl = project3D(-G, -G, 0, w, h);
   if (!tl || !tr || !br || !bl) return;
 
-  // Canvas corners (front edges) ��� kept for layout calls below.
+  // Canvas corners (front edges) kept for layout calls below.
   const ftl = { px: 0,  py: 0  };
   const ftr = { px: w,  py: 0  };
   const fbr = { px: w,  py: h  };
   const fbl = { px: 0,  py: h  };
 
-  // No wall fills, no seam outlines, no mitre lines ��� only the central
+  // No wall fills, no seam outlines, no mitre lines; only the central
   // playfield square stays. HUD text panels are drawn flush against the
   // projected playfield edges below.
 
@@ -1376,7 +916,7 @@ function drawTopWall(ftl, ftr, tl, tr) {
   const time     = els.timeLabel?.textContent || "";
   const w = els.canvas.width;
 
-  // Header is anchored to the canvas top, NOT the playfield ��� matches the
+  // Header is anchored to the canvas top, not the playfield. This matches the
   // real Rhythia HUD where title/time stack vertically with a thin divider
   // running underneath.
   const centerX = w / 2;
@@ -1405,7 +945,7 @@ function drawTopWall(ftl, ftr, tl, tr) {
   ctx.font = "600 18px 'JetBrains Mono'";
   ctx.fillText(time, centerX, 70);
 
-  // Top progress bar ��� display-only, grey track + white fill, sits under
+  // Top progress bar: display-only, grey track + white fill, sits under
   // the title block. Width matches the health bar (playfield width + 40px
   // outset on each side) so the two read as a matched pair.
   const pct = parseFloat(els.progressFill?.style.width || "0") || 0;
@@ -1515,13 +1055,13 @@ function drawLeftWall(ftl, tl, bl, fbl) {
   // Combo triangle aligned vertically with the top playfield bracket
   drawComboTriangle(colX, tl.py + 80, els.comboVal?.textContent || "0x");
 
-  // PAUSES ��� just below the combo triangle
+  // PAUSES: just below the combo triangle.
   drawSideStat(colX, tl.py + 180,
     "PAUSES",
     els.pauseVal?.textContent || "0",
     { size: 22, gap: 28 });
 
-  // Rank ��� large letter (no label in real game), centered vertically
+  // Rank: large letter (no label in real game), centered vertically.
   const rank = els.rankVal?.textContent || "D";
   ctx.fillStyle = "#f3c79a";
   ctx.font = "700 60px 'Space Grotesk'";
@@ -1529,7 +1069,7 @@ function drawLeftWall(ftl, tl, bl, fbl) {
   ctx.textBaseline = "middle";
   ctx.fillText(rank, colX, h * 0.60);
 
-  // ACCURACY ��� closer to the rank letter, not pinned to the bottom bracket
+  // ACCURACY: closer to the rank letter, not pinned to the bottom bracket.
   drawSideStat(colX, h * 0.76,
     "ACCURACY",
     els.accVal?.textContent || "0%",
@@ -1562,14 +1102,14 @@ function drawRightWall(ftr, tr, br, fbr) {
     els.pointsVal?.textContent || "0",
     { size: 22, gap: 28 });
 
-  // MISSES ��� default white, only flashes red briefly when a miss lands.
+  // MISSES: default white, only flashes red briefly when a miss lands.
   const flashElapsed = performance.now() - state.missFlashAt;
   const FLASH_DUR = 450;
   let missColor = "#ffffff";
   let shakeX = 0;
   if (state.missFlashAt > 0 && flashElapsed < FLASH_DUR) {
     const k = 1 - flashElapsed / FLASH_DUR;
-    // Lerp red ��� white
+    // Lerp red to white.
     const r = 255;
     const g = Math.round(255 - (255 - 119) * k);
     const b = Math.round(255 - (255 - 133) * k);
@@ -1584,7 +1124,7 @@ function drawRightWall(ftr, tr, br, fbr) {
     { size: 22, color: missColor, gap: 28 });
   ctx.restore();
 
-  // NOTES ��� closer to the misses block, not pinned to the bottom bracket
+  // NOTES: closer to the misses block, not pinned to the bottom bracket.
   drawSideStat(colX, h * 0.76,
     "NOTES",
     els.noteCountVal?.textContent || "0/0",
@@ -1966,13 +1506,9 @@ function attachDnD() {
     const file = e.dataTransfer?.files?.[0];
     if (!file) return;
     try {
-      if (/\.rhs$/i.test(file.name)) {
-        await loadSkinFile(file);
-      } else {
-        await loadReplayFile(file);
-      }
+      await loadReplayFile(file);
     } catch (err) {
-      alert(err.message || "Failed to load file.");
+      alert(err.message || "Failed to parse replay.");
     }
   });
 }
@@ -1987,7 +1523,7 @@ function togglePlayback() {
 }
 
 function attachControls() {
-  // Play button is gone ��� click anywhere on the canvas to toggle playback.
+  // Play button is gone; click anywhere on the canvas to toggle playback.
   // The toolbar still has a hidden #playPause
   // node; we just don't bind a click listener to it.
 
