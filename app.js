@@ -4,6 +4,12 @@ const els = {
   fileInput: document.getElementById("fileInput"),
   openFile: document.getElementById("openFile"),
   viewerSettingsBtn: document.getElementById("viewerSettingsBtn"),
+  audioControlBtn: document.getElementById("audioControlBtn"),
+  audioPopup: document.getElementById("audioPopup"),
+  musicVolumeSlider: document.getElementById("musicVolumeSlider"),
+  musicVolumeVal: document.getElementById("musicVolumeVal"),
+  hitsoundVolumeSlider: document.getElementById("hitsoundVolumeSlider"),
+  hitsoundVolumeVal: document.getElementById("hitsoundVolumeVal"),
   settingsPanel: document.getElementById("settingsPanel"),
   setHighlightMisses: document.getElementById("setHighlightMisses"),
   setShowFps: document.getElementById("setShowFps"),
@@ -22,6 +28,8 @@ const els = {
   setMarkerPauses: document.getElementById("setMarkerPauses"),
   setSidePanelOpacity: document.getElementById("setSidePanelOpacity"),
   setSidePanelOpacityVal: document.getElementById("setSidePanelOpacityVal"),
+  setAudioOffset: document.getElementById("setAudioOffset"),
+  setAudioOffsetVal: document.getElementById("setAudioOffsetVal"),
   setCursorColor: document.getElementById("setCursorColor"),
   setNotesColor: document.getElementById("setNotesColor"),
   canvas: document.getElementById("view"),
@@ -85,6 +93,9 @@ const state = {
   viewerSettings: null,
   settingsOpen: false,
   settingsTab: "main",
+  audioPopupOpen: false,
+  musicVolume: 1.0,      // 0.0 to 1.0
+  hitsoundVolume: 1.0,   // 0.0 to 1.0 (for future hitsound effects)
 };
 
 const VIEWER_SETTINGS_KEY = "rvViewerSettingsV2";
@@ -108,6 +119,9 @@ const DEFAULT_VIEWER_SETTINGS = {
   sidePanelOpacity: 0.5,
   cursorColor: "#ffffff",
   notesColor: "#6ec3ff",
+  musicVolume: 1.0,
+  hitsoundVolume: 1.0,
+  audioOffsetMs: 0,
 };
 
 function clamp(n, min, max) {
@@ -147,6 +161,15 @@ function loadViewerSettings() {
         : DEFAULT_VIEWER_SETTINGS.sidePanelOpacity,
       cursorColor: normalizeHexColor(parsed.cursorColor, DEFAULT_VIEWER_SETTINGS.cursorColor),
       notesColor: normalizeHexColor(parsed.notesColor, DEFAULT_VIEWER_SETTINGS.notesColor),
+      musicVolume: Number.isFinite(Number(parsed.musicVolume))
+        ? clamp(Number(parsed.musicVolume), 0, 1)
+        : DEFAULT_VIEWER_SETTINGS.musicVolume,
+      hitsoundVolume: Number.isFinite(Number(parsed.hitsoundVolume))
+        ? clamp(Number(parsed.hitsoundVolume), 0, 1)
+        : DEFAULT_VIEWER_SETTINGS.hitsoundVolume,
+      audioOffsetMs: Number.isFinite(Number(parsed.audioOffsetMs))
+        ? clamp(Number(parsed.audioOffsetMs), -1000, 1000)
+        : DEFAULT_VIEWER_SETTINGS.audioOffsetMs,
     };
   } catch {
     return { ...DEFAULT_VIEWER_SETTINGS };
@@ -522,7 +545,71 @@ async function fetchMapAssets(mapPageId) {
   if (!sspmRes.ok) throw new Error("SSPM download failed: " + sspmRes.status);
   const buf = await sspmRes.arrayBuffer();
   const parsed = parseSspm(buf);
-  return { ...parsed, beatmap: meta.beatmap };
+  return { ...parsed, beatmap: meta.beatmap, scores: Array.isArray(meta?.scores) ? meta.scores : [] };
+}
+
+function normalizeModsList(mods) {
+  if (!Array.isArray(mods)) return [];
+  return mods
+    .map((m) => String(m || "").trim().toLowerCase())
+    .filter(Boolean)
+    .sort();
+}
+
+function modsMatch(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+function resolveAwardedSp(replay, scores, missCount) {
+  if (!Array.isArray(scores) || scores.length === 0) return null;
+
+  const replayMods = normalizeModsList(replay.mods);
+  const replaySpeed = Number(replay.speedMod);
+  const replayTs = Number(replay.rawTimestamp);
+  const totalNotes = Array.isArray(replay.noteHits) ? replay.noteHits.length : 0;
+  const replayAcc = totalNotes > 0
+    ? ((totalNotes - missCount) / totalNotes) * 100
+    : null;
+
+  const matches = [];
+  for (const s of scores) {
+    if (!s || !Number.isFinite(Number(s.awarded_sp))) continue;
+    if (!modsMatch(replayMods, normalizeModsList(s.mods))) continue;
+
+    const sSpeed = Number(s.speed);
+    if (Number.isFinite(replaySpeed) && Number.isFinite(sSpeed) && Math.abs(sSpeed - replaySpeed) > 0.002) continue;
+
+    const sMisses = Number(s.misses);
+    if (Number.isFinite(sMisses) && sMisses !== missCount) continue;
+
+    const sAcc = Number(s.accuracy);
+    if (Number.isFinite(replayAcc) && Number.isFinite(sAcc) && Math.abs(sAcc - replayAcc) > 0.05) continue;
+
+    const createdAtMs = Date.parse(String(s.created_at || ""));
+    const timeDiff = Number.isFinite(replayTs) && Number.isFinite(createdAtMs)
+      ? Math.abs(createdAtMs - replayTs)
+      : Number.POSITIVE_INFINITY;
+
+    matches.push({
+      awardedSp: Number(s.awarded_sp),
+      timeDiff,
+    });
+  }
+
+  if (matches.length === 0) return null;
+  matches.sort((a, b) => a.timeDiff - b.timeDiff);
+  return matches[0].awardedSp;
+}
+
+function formatPoints(value) {
+  if (!Number.isFinite(value)) return "\u2014";
+  const rounded = Math.round(value);
+  if (Math.abs(value - rounded) < 1e-6) return String(rounded);
+  return value.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
 }
 
 /** Convert SSPM grid coordinates (x,y in [0,2]) to world coords on the hit plane.
@@ -612,12 +699,15 @@ async function loadMapNotes(replay) {
   replay.noteHits = computeNoteHits(replay, speedScale);
   rebuildReplayMarkers(replay);
 
+  let misses = 0;
   if (Array.isArray(replay.noteHits)) {
-    let misses = 0;
     for (const v of replay.noteHits) if (v === "miss") misses++;
     replay.missCount = misses;
     if (els.missVal) els.missVal.textContent = String(misses);
   }
+
+  const awardedSp = resolveAwardedSp(replay, data.scores, misses);
+  replay.awardedSp = Number.isFinite(awardedSp) ? awardedSp : null;
 
   // Update song name from the properly-cased API title.
   if (data.beatmap?.title && state.replay === replay) {
@@ -651,6 +741,7 @@ function setupAudio(bytes, mime, notesTimeScale) {
 
   const audio = new Audio();
   audio.preload = "auto";
+  audio.volume = state.musicVolume;
 
   state.audio = audio;
   state.audioUrl = null;
@@ -745,14 +836,17 @@ function syncAudioToTimeline(force) {
   const audio = state.audio;
   if (!audio || !state.audioReady) return;
   const targetSec = replayMsToSongSec(replayMs());
+  // Apply audio offset (convert milliseconds to seconds)
+  const offsetSec = (state.viewerSettings?.audioOffsetMs || 0) / 1000;
+  const adjustedSec = targetSec + offsetSec;
   // Audio playback rate must equal replay-speed / notesTimeScale so that
   // d(songTime)/d(realTime) matches d(replayTime)/d(realTime) / notesTimeScale.
   const desiredRate = (state.speed || 1) / (state.audioTimeScale || 1);
   if (Math.abs(audio.playbackRate - desiredRate) > 0.001) {
     audio.playbackRate = Math.max(0.0625, Math.min(16, desiredRate));
   }
-  if (force || Math.abs(audio.currentTime - targetSec) > AUDIO_DRIFT_RESYNC_SEC) {
-    try { audio.currentTime = Math.max(0, Math.min(audio.duration || targetSec, targetSec)); } catch {}
+  if (force || Math.abs(audio.currentTime - adjustedSec) > AUDIO_DRIFT_RESYNC_SEC) {
+    try { audio.currentTime = Math.max(0, Math.min(audio.duration || adjustedSec, adjustedSec)); } catch {}
   }
   // Hard-mute (and pause) during the pre/post-roll grace windows so the
   // viewer is silent while the playfield is empty.
@@ -1697,7 +1791,15 @@ function updateStatsUI() {
   if (els.rankVal)      els.rankVal.textContent      = accuracyToRank(accFrac);
   // X/Y where Y is notes reached so far (hits + misses), not total song notes.
   if (els.noteCountVal) els.noteCountVal.textContent = `${hits}/${hits + misses}`;
-  if (els.pointsVal)    els.pointsVal.textContent    = "\u2014"; // pp not derivable from .rhr yet
+  if (els.pointsVal) {
+    const totalPoints = Number(replay.awardedSp);
+    if (Number.isFinite(totalPoints)) {
+      const progress = replay.notes.length > 0 ? (processed / replay.notes.length) : 0;
+      els.pointsVal.textContent = formatPoints(totalPoints * progress);
+    } else {
+      els.pointsVal.textContent = "\u2014";
+    }
+  }
   if (els.healthFill) {
     els.healthFill.style.width = health.toFixed(1) + "%";
     els.healthFill.style.background = health < 25 ? "#ff7785" : health < 55 ? "#f7c08a" : "#4ade80";
@@ -1952,8 +2054,20 @@ function attachControls() {
     els.setMarkerPauses.checked = !!s.markerPauses;
     els.setSidePanelOpacity.value = String(Math.round(clamp(s.sidePanelOpacity, 0, 1) * 100));
     els.setSidePanelOpacityVal.textContent = `${Math.round(clamp(s.sidePanelOpacity, 0, 1) * 100)}%`;
+    els.setAudioOffset.value = String(Math.round(s.audioOffsetMs));
+    els.setAudioOffsetVal.textContent = `${Math.round(s.audioOffsetMs)} ms`;
     els.setCursorColor.value = normalizeHexColor(s.cursorColor, DEFAULT_VIEWER_SETTINGS.cursorColor);
     els.setNotesColor.value = normalizeHexColor(s.notesColor, DEFAULT_VIEWER_SETTINGS.notesColor);
+    
+    // Audio volume popup
+    state.musicVolume = s.musicVolume;
+    state.hitsoundVolume = s.hitsoundVolume;
+    els.musicVolumeSlider.value = String(Math.round(s.musicVolume * 100));
+    els.musicVolumeVal.textContent = `${Math.round(s.musicVolume * 100)}%`;
+    els.hitsoundVolumeSlider.value = String(Math.round(s.hitsoundVolume * 100));
+    els.hitsoundVolumeVal.textContent = `${Math.round(s.hitsoundVolume * 100)}%`;
+    els.audioPopup.classList.toggle("hidden", !state.audioPopupOpen);
+    
     els.settingsPanel.classList.toggle("hidden", !state.settingsOpen);
     if (state.settingsOpen) positionSettingsPanel();
   };
@@ -2051,6 +2165,37 @@ function attachControls() {
     state.viewerSettings.sidePanelOpacity = pct / 100;
     els.setSidePanelOpacityVal.textContent = `${Math.round(pct)}%`;
     applySettings();
+  });
+
+  els.setAudioOffset.addEventListener("input", () => {
+    const offset = clamp(Number(els.setAudioOffset.value) || 0, -1000, 1000);
+    state.viewerSettings.audioOffsetMs = offset;
+    els.setAudioOffsetVal.textContent = `${Math.round(offset)} ms`;
+    saveViewerSettings();
+  });
+
+  els.audioControlBtn.addEventListener("click", () => {
+    state.audioPopupOpen = !state.audioPopupOpen;
+    syncSettingsUI();
+  });
+
+  els.musicVolumeSlider.addEventListener("input", () => {
+    const pct = clamp(Number(els.musicVolumeSlider.value) || 0, 0, 100);
+    state.viewerSettings.musicVolume = pct / 100;
+    state.musicVolume = state.viewerSettings.musicVolume;
+    els.musicVolumeVal.textContent = `${Math.round(pct)}%`;
+    if (state.audio) {
+      state.audio.volume = state.musicVolume;
+    }
+    saveViewerSettings();
+  });
+
+  els.hitsoundVolumeSlider.addEventListener("input", () => {
+    const pct = clamp(Number(els.hitsoundVolumeSlider.value) || 0, 0, 100);
+    state.viewerSettings.hitsoundVolume = pct / 100;
+    state.hitsoundVolume = state.viewerSettings.hitsoundVolume;
+    els.hitsoundVolumeVal.textContent = `${Math.round(pct)}%`;
+    saveViewerSettings();
   });
 
   els.setCursorColor.addEventListener("input", () => {

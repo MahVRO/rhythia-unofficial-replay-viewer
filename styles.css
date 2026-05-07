@@ -64,6 +64,9 @@ canvas {
 .btn-icon {
   width: 28px;
   height: 28px;
+  min-width: 28px;
+  min-height: 28px;
+  flex: 0 0 28px;
   display: grid;
   place-items: center;
   background: none;
@@ -72,6 +75,8 @@ canvas {
   cursor: pointer;
   padding: 3px;
   border-radius: 6px;
+  overflow: hidden;
+  contain: paint;
   opacity: 0.75;
   transition: opacity 120ms, background 120ms;
 }
@@ -83,9 +88,15 @@ canvas {
 }
 
 .btn-icon-img {
-  width: 18px;
-  height: 18px;
+  width: 18px !important;
+  height: 18px !important;
+  max-width: 18px;
+  max-height: 18px;
+  min-width: 18px;
+  min-height: 18px;
   display: block;
+  object-fit: contain;
+  overflow: hidden;
   color: rgba(255,255,255,0.95);
   opacity: 0.95;
 }
@@ -361,6 +372,103 @@ canvas {
     bottom: 74px;
     left: 10px;
     width: min(300px, calc(100vw - 20px));
+  }
+}
+
+/* Audio control popup */
+.audio-popup {
+  position: fixed;
+  right: auto;
+  left: 16px;
+  bottom: 78px;
+  z-index: 7;
+  background: rgba(2, 6, 12, 0.88);
+  border: 1px solid rgba(255,255,255,0.1);
+  border-radius: 12px;
+  padding: 12px;
+  backdrop-filter: blur(10px);
+}
+
+.audio-popup-content {
+  display: flex;
+  gap: 20px;
+  align-items: flex-end;
+}
+
+.audio-slider-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.audio-slider-label {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0.8;
+}
+
+.audio-label-icon {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
+  color: rgba(255,255,255,0.9);
+  display: block;
+}
+
+.audio-slider.vertical {
+  width: 2px;
+  height: 120px;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  cursor: pointer;
+  accent-color: #a855f7;
+}
+
+.audio-slider.vertical::-webkit-slider-thumb {
+  -webkit-appearance: slider-thumb;
+  appearance: slider-thumb;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #a855f7;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(168, 85, 247, 0.6);
+}
+
+.audio-slider.vertical::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #a855f7;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(168, 85, 247, 0.6);
+}
+
+.audio-slider.vertical::-moz-range-track {
+  background: rgba(255,255,255,0.1);
+  border: none;
+}
+
+.audio-slider.vertical::-moz-range-progress {
+  background: rgba(168, 85, 247, 0.3);
+}
+
+.audio-value {
+  font-size: 0.7rem;
+  color: rgba(255,255,255,0.65);
+  text-align: center;
+  min-width: 32px;
+}
+
+@media (max-width: 900px) {
+  .audio-popup {
+    left: 10px;
+    bottom: 74px;
   }
 }
 
