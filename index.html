@@ -47,9 +47,6 @@
     <button class="btn-icon" id="viewerSettingsBtn" title="Viewer settings" aria-label="Viewer settings">
       <img class="btn-icon-img" src="assets/icons/settings.svg" alt="" aria-hidden="true" />
     </button>
-    <button class="btn-icon" id="audioControlBtn" title="Audio volume" aria-label="Audio volume">
-      <img class="btn-icon-img" src="assets/icons/audio.svg" alt="" aria-hidden="true" />
-    </button>
     <button id="playPause" disabled title="Play / pause">&#9654;</button>
     <div class="speed-box" aria-label="Playback speed">
       <button class="speed-arrow" id="speedDown" type="button" disabled title="Decrease speed">&#9664;</button>
@@ -61,6 +58,9 @@
       <div id="seekMarkers" class="ipb-markers" aria-hidden="true"></div>
       <input id="seek" class="ipb-slider" type="range" min="0" max="1" step="0.0001" value="0" disabled />
     </div>
+    <button class="btn-icon" id="audioControlBtn" title="Audio volume" aria-label="Audio volume">
+      <img class="btn-icon-img" src="assets/icons/audio.svg" alt="" aria-hidden="true" />
+    </button>
   </div>
 
   <!-- Audio control popup -->
@@ -70,15 +70,17 @@
         <div class="audio-slider-label">
           <img src="assets/icons/music.svg" alt="Music volume" class="audio-label-icon" />
         </div>
-        <input id="musicVolumeSlider" class="audio-slider vertical" type="range" min="0" max="100" value="100" />
-        <span id="musicVolumeVal" class="audio-value">100%</span>
+        <div class="audio-slider-wrap">
+          <input id="musicVolumeSlider" class="audio-slider vertical" type="range" min="0" max="100" value="100" />
+        </div>
       </div>
       <div class="audio-slider-group">
         <div class="audio-slider-label">
           <img src="assets/icons/note.svg" alt="Hitsound volume" class="audio-label-icon" />
         </div>
-        <input id="hitsoundVolumeSlider" class="audio-slider vertical" type="range" min="0" max="100" value="100" />
-        <span id="hitsoundVolumeVal" class="audio-value">100%</span>
+        <div class="audio-slider-wrap">
+          <input id="hitsoundVolumeSlider" class="audio-slider vertical" type="range" min="0" max="100" value="100" />
+        </div>
       </div>
     </div>
   </div>
@@ -113,6 +115,11 @@
         <label class="rv-slider" title="How far notes come, in milliseconds.">
           <span>Reaction time: <strong id="setReactionTimeVal">500 ms</strong></span>
           <input id="setReactionTime" type="range" min="200" max="1200" step="10" value="500" />
+        </label>
+
+        <label class="rv-slider" title="Adjust audio sync by shifting playback time.">
+          <span>Audio offset: <strong id="setAudioOffsetVal">0 ms</strong></span>
+          <input id="setAudioOffset" type="range" min="-1000" max="1000" step="50" value="0" />
         </label>
 
         <label class="rv-row" title="Toggle HUD visibility.">
@@ -162,11 +169,6 @@
         <label class="rv-slider" title="Adjust opacity of left/right HUD side panels.">
           <span>Side panel opacity: <strong id="setSidePanelOpacityVal">50%</strong></span>
           <input id="setSidePanelOpacity" type="range" min="0" max="100" step="1" value="50" />
-        </label>
-
-        <label class="rv-slider" title="Adjust audio sync by shifting playback time.">
-          <span>Audio offset: <strong id="setAudioOffsetVal">0 ms</strong></span>
-          <input id="setAudioOffset" type="range" min="-1000" max="1000" step="50" value="0" />
         </label>
 
         <div class="rv-row" title="Choose the cursor color in the replay view.">

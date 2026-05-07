@@ -7,9 +7,7 @@ const els = {
   audioControlBtn: document.getElementById("audioControlBtn"),
   audioPopup: document.getElementById("audioPopup"),
   musicVolumeSlider: document.getElementById("musicVolumeSlider"),
-  musicVolumeVal: document.getElementById("musicVolumeVal"),
   hitsoundVolumeSlider: document.getElementById("hitsoundVolumeSlider"),
-  hitsoundVolumeVal: document.getElementById("hitsoundVolumeVal"),
   settingsPanel: document.getElementById("settingsPanel"),
   setHighlightMisses: document.getElementById("setHighlightMisses"),
   setShowFps: document.getElementById("setShowFps"),
@@ -76,7 +74,7 @@ const state = {
   audioReady: false,
   audioTimeScale: 1,     // playbackRate multiplier so song-time tracks replay-time
   gracePreMs: 400,       // silence before the first note
-  gracePostMs: 4000,     // silence after the last note / song end
+  gracePostMs: 2000,     // silence after the last note / song end
   pauseCount: 0,         // user-triggered pauses during playback
   lastMissCount: 0,      // edge detector for the miss flash effect
   missFlashAt: 0,        // performance.now() of the most recent new miss
@@ -96,6 +94,10 @@ const state = {
   audioPopupOpen: false,
   musicVolume: 1.0,      // 0.0 to 1.0
   hitsoundVolume: 1.0,   // 0.0 to 1.0 (for future hitsound effects)
+  hitsoundPlayers: [],
+  hitsoundPlayerIndex: 0,
+  lastJudgedNoteIndex: -1,
+  lastReplayMsForHitsound: 0,
 };
 
 const VIEWER_SETTINGS_KEY = "rvViewerSettingsV2";
@@ -105,6 +107,7 @@ const RHR_FRAME_STRIDE_BYTES = 17;
 const NOTE_HIT_TOLERANCE_MS = 60;
 const PAUSE_GAP_MS = 120;
 const AUDIO_DRIFT_RESYNC_SEC = 0.12;
+const DEFAULT_HITSOUND_URL = "assets/audio/default_hitsound.mp3";
 // Keep this in one place so endpoint swaps are easy.
 const RHYTHIA_API_BEATMAP_PAGE_URL = "https://production.rhythia.com/api/getBeatmapPage";
 const DEFAULT_VIEWER_SETTINGS = {
@@ -140,6 +143,33 @@ function hexToRgb(value) {
     g: Number.parseInt(hex.slice(2, 4), 16),
     b: Number.parseInt(hex.slice(4, 6), 16),
   };
+}
+
+function initHitsoundPool() {
+  const poolSize = 10;
+  state.hitsoundPlayers = [];
+  state.hitsoundPlayerIndex = 0;
+  for (let i = 0; i < poolSize; i++) {
+    const a = new Audio(DEFAULT_HITSOUND_URL);
+    a.preload = "auto";
+    a.volume = clamp(state.hitsoundVolume, 0, 1);
+    state.hitsoundPlayers.push(a);
+  }
+}
+
+function playHitsound() {
+  if (!state.hitsoundPlayers.length) return;
+  const volume = clamp(state.hitsoundVolume, 0, 1);
+  if (volume <= 0) return;
+  const idx = state.hitsoundPlayerIndex % state.hitsoundPlayers.length;
+  const a = state.hitsoundPlayers[idx];
+  state.hitsoundPlayerIndex = (idx + 1) % state.hitsoundPlayers.length;
+  try {
+    a.pause();
+    a.currentTime = 0;
+    a.volume = volume;
+    a.play().catch(() => {});
+  } catch {}
 }
 
 function loadViewerSettings() {
@@ -1772,6 +1802,19 @@ function updateStatsUI() {
     else { misses++; combo = 0; }
   }
 
+  const justSeekedBack = tNow + 1 < state.lastReplayMsForHitsound;
+  if (justSeekedBack || !state.isPlaying) {
+    state.lastJudgedNoteIndex = processed - 1;
+  } else if (processed - 1 > state.lastJudgedNoteIndex) {
+    const start = Math.max(0, state.lastJudgedNoteIndex + 1);
+    const end = processed - 1;
+    for (let i = start; i <= end; i++) {
+      if (replay.noteHits[i] === "hit") playHitsound();
+    }
+    state.lastJudgedNoteIndex = end;
+  }
+  state.lastReplayMsForHitsound = tNow;
+
   // SS-style scoring approximation: 1000 per hit + small combo bonus.
   const score = hits * 1000 + Math.min(combo, 64) * 5 * hits;
   const accFrac = processed > 0 ? hits / processed : 0;
@@ -1845,6 +1888,8 @@ async function loadReplayFile(file) {
     state.pauseCount = 0;
     state.lastMissCount = 0;
     state.missFlashAt = 0;
+    state.lastJudgedNoteIndex = -1;
+    state.lastReplayMsForHitsound = 0;
     if (els.pauseVal) els.pauseVal.textContent = "0";
     els.playPause.innerHTML = "&#9654;";
     renderMeta(replay);
@@ -2063,10 +2108,9 @@ function attachControls() {
     state.musicVolume = s.musicVolume;
     state.hitsoundVolume = s.hitsoundVolume;
     els.musicVolumeSlider.value = String(Math.round(s.musicVolume * 100));
-    els.musicVolumeVal.textContent = `${Math.round(s.musicVolume * 100)}%`;
     els.hitsoundVolumeSlider.value = String(Math.round(s.hitsoundVolume * 100));
-    els.hitsoundVolumeVal.textContent = `${Math.round(s.hitsoundVolume * 100)}%`;
     els.audioPopup.classList.toggle("hidden", !state.audioPopupOpen);
+    if (state.audioPopupOpen) positionAudioPanel();
     
     els.settingsPanel.classList.toggle("hidden", !state.settingsOpen);
     if (state.settingsOpen) positionSettingsPanel();
@@ -2089,6 +2133,23 @@ function attachControls() {
     els.settingsPanel.style.bottom = `${bottom}px`;
   };
 
+  const positionAudioPanel = () => {
+    if (!els.audioPopup || !els.audioControlBtn) return;
+
+    const btnRect = els.audioControlBtn.getBoundingClientRect();
+    const panelRect = els.audioPopup.getBoundingClientRect();
+    const margin = 12;
+    const panelW = panelRect.width || 96;
+
+    const desiredLeft = btnRect.left + btnRect.width * 0.5 - panelW * 0.5;
+    const maxLeft = Math.max(margin, window.innerWidth - panelW - margin);
+    const clampedLeft = clamp(desiredLeft, margin, maxLeft);
+    const bottom = Math.max(margin, window.innerHeight - btnRect.top + 8);
+
+    els.audioPopup.style.left = `${clampedLeft}px`;
+    els.audioPopup.style.bottom = `${bottom}px`;
+  };
+
   const applySettings = () => {
     saveViewerSettings();
     updateIpbMarkers();
@@ -2102,6 +2163,7 @@ function attachControls() {
 
   window.addEventListener("resize", () => {
     if (state.settingsOpen) positionSettingsPanel();
+    if (state.audioPopupOpen) positionAudioPanel();
   });
 
   els.setTabMain.addEventListener("click", () => {
@@ -2183,7 +2245,6 @@ function attachControls() {
     const pct = clamp(Number(els.musicVolumeSlider.value) || 0, 0, 100);
     state.viewerSettings.musicVolume = pct / 100;
     state.musicVolume = state.viewerSettings.musicVolume;
-    els.musicVolumeVal.textContent = `${Math.round(pct)}%`;
     if (state.audio) {
       state.audio.volume = state.musicVolume;
     }
@@ -2194,7 +2255,6 @@ function attachControls() {
     const pct = clamp(Number(els.hitsoundVolumeSlider.value) || 0, 0, 100);
     state.viewerSettings.hitsoundVolume = pct / 100;
     state.hitsoundVolume = state.viewerSettings.hitsoundVolume;
-    els.hitsoundVolumeVal.textContent = `${Math.round(pct)}%`;
     saveViewerSettings();
   });
 
@@ -2209,8 +2269,10 @@ function attachControls() {
   });
 
   window.addEventListener("keydown", (e) => {
-    if (e.code !== "Escape" || !state.settingsOpen) return;
+    if (e.code !== "Escape") return;
+    if (!state.settingsOpen && !state.audioPopupOpen) return;
     state.settingsOpen = false;
+    state.audioPopupOpen = false;
     syncSettingsUI();
   });
 
@@ -2219,6 +2281,7 @@ function attachControls() {
 
 setLoadedState(false);
 updateSpeedUI();
+initHitsoundPool();
 attachDnD();
 attachControls();
 requestAnimationFrame(tick);
